@@ -1,0 +1,93 @@
+baseDir='C:\Users\jhan3\OneDrive\桌面\大二專題';
+% 驗證集圖片
+imgDir=fullfile(baseDir,'Report_Images');
+% 論文中的結果
+gtFile=fullfile(baseDir,'Ground_Truth_Dev_100.csv');
+% 我的結果
+pdFile=fullfile(baseDir,'Crater_Results_Check.csv');
+
+outputDir=fullfile(baseDir,'Verification_Results_2');  
+
+if ~exist(outputDir,'dir')
+    mkdir(outputDir); 
+end
+
+% 1. 讀取數據
+gtData=readtable(gtFile);
+pdData=readtable(pdFile);
+gtData = gtData(gtData.Diameter_pix_ > 10, :);
+fprintf('過濾後，官方標準答案剩餘 %d 筆標籤。\n', size(gtData, 1));
+
+% 2. 統計變數初始化
+TP = 0; FP = 0; FN = 0;
+distLimit = 25; % 中心點距離門檻 (像素)
+
+
+% 獲取這 100 張圖的名字
+fileList = unique(gtData.FileName);
+numFiles = length(fileList);
+
+fprintf('開始對 %d 張圖片進行交叉驗證\n', numFiles);
+
+for i = 1:numFiles
+    imgName = fileList{i};
+    
+    % 篩選資料
+    gt_sub = gtData(strcmp(gtData.FileName, imgName), :);
+    pd_sub = pdData(strcmp(pdData.FileName, imgName), :);
+    gt_matched = false(size(gt_sub, 1), 1);
+    pd_matched = false(size(pd_sub, 1), 1);
+    
+    % --- 比對演算法 ---
+    for p = 1:size(pd_sub, 1)
+        for g = 1:size(gt_sub, 1)
+            dist = sqrt((pd_sub.X(p) - gt_sub.x(g))^2 + (pd_sub.Y(p) - gt_sub.y(g))^2);
+            if dist < distLimit
+                pd_matched(p) = true;
+                gt_matched(g) = true;
+                break;
+            end
+        end
+    end
+    
+    % 累加統計
+    TP = TP + sum(pd_matched);
+    FP = FP + sum(~pd_matched);
+    FN = FN + sum(~gt_matched);
+    
+    % --- 自動生成對照圖 (每張都存) ---
+    h = figure('Visible', 'off'); % 不跳出視窗，靜默處理
+    try
+        img = imread(fullfile(devDir, imgName));
+        imshow(img, []); hold on;
+        
+        % 畫前輩的答案 (藍色實線)
+        if ~isempty(gt_sub)
+            viscircles([gt_sub.x, gt_sub.y], gt_sub.Diameter_pix_/2, 'EdgeColor', 'b', 'LineWidth', 0.5);
+        end
+        
+        % 畫你的答案 (紅色虛線)
+        if ~isempty(pd_sub)
+            viscircles([pd_sub.X, pd_sub.Y], pd_sub.Radius, 'EdgeColor', 'r', 'LineStyle', '--', 'LineWidth', 1);
+        end
+        
+        title(sprintf('%s: TP=%d, FP=%d, FN=%d', imgName, sum(pd_matched), sum(~pd_matched), sum(~gt_matched)));
+        saveas(h, fullfile(outputDir, ['Compare_', imgName]));
+    catch
+        fprintf('警告: 找不到圖片 %s\n', imgName);
+    end
+    close(h);
+    
+    if mod(i, 20) == 0, fprintf('已驗證 %d 張...\n', i); end
+end
+
+% --- 計算最終分數 ---
+Precision = TP / (TP + FP);
+Recall = TP / (TP + FN);
+F1 = 2 * (Precision * Recall) / (Precision + Recall);
+
+fprintf('100張全量驗證完成！\n');
+fprintf('整體準確率 (Precision): %.2f%%\n', Precision * 100);
+fprintf('整體召回率 (Recall): %.2f%%\n', Recall * 100);
+fprintf('F1-Score: %.4f\n', F1);
+fprintf('對照圖片已存入: %s\n', outputDir);
