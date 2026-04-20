@@ -1,0 +1,132 @@
+%% 2. 效能基準測試 (Benchmarking)
+% 我們從 Development_Set 挑選 100 張來測試時間
+
+load('DeepMoon_Net.mat'); % 確保模型已載入
+
+dummyInput = dlarray(ones(256, 256, 1, 1), 'SSCB');
+net = initialize(net, dummyInput);
+
+devFiles = dir(fullfile(devDir, '*.png'));
+numBench = min(100, length(devFiles)); % 設定跑 100 張
+
+fprintf('啟動 100 張基準測試...\n');
+
+% 準備計時
+totalInferenceTime = 0;
+totalPostProcessTime = 0;
+
+tic; % 總計時開始
+
+for i = 1:numBench
+    % --- A. 讀取圖片 ---
+    if ~isempty(radii)
+        % 將這張圖的檔名、圓心 X、圓心 Y、半徑 封裝起來
+        % centers(:,1) 是 X, centers(:,2) 是 Y
+        allResults{i} = [repmat({imgName}, length(radii), 1), ...
+                         num2cell(centers), num2cell(radii)];
+    else
+        % 如果沒抓到坑，就留空
+        allResults{i} = [];
+    end
+    
+    if mod(i, 10) == 0, fprintf('已處理 %d 張...\n', i); 
+    end
+
+    imgName = devFiles(i).name;
+    img = imread(fullfile(devDir, imgName));
+    if size(img, 3) == 3, img = rgb2gray(img);
+    end
+    imgInput = im2single(img);
+    
+    % --- B. 模型推論 (Inference) ---
+    tStart = tic;
+    X = dlarray(imgInput, 'SSCB');
+    Y = predict(net, X);
+    result_2d = squeeze(extractdata(Y));
+    totalInferenceTime = totalInferenceTime + toc(tStart);
+    
+    % --- C. 後處理 (Post-processing) ---
+    tProcStart = tic;
+    binary_map = result_2d > 0.02; % 你可以在這調整門檻
+    clean_map = bwareaopen(binary_map, 10);
+    [centers, radii] = imfindcircles(clean_map, [5 50], 'Sensitivity', 0.92);
+    totalPostProcessTime = totalPostProcessTime + toc(tProcStart);
+end
+
+% --- 迴圈結束 ---
+fprintf('\n偵測任務完成，正在整合數據...\n');
+
+% 1. 這裡先定義 validData
+% vertcat 會把 allResults 裡面所有的格子接起來
+try
+    validData = vertcat(allResults{:}); 
+catch
+    validData = []; % 如果接失敗了，就給它空的，避免報錯
+end
+
+% 2. 接著才做 if 判斷
+if ~isempty(validData)
+    % 轉換為 Table
+    finalTable = cell2table(validData, 'VariableNames', {'FileName', 'X', 'Y', 'Radius'});
+    
+    % 存成 CSV
+    writetable(finalTable, 'Crater_Results_Check.csv');
+    fprintf('✅ 成功！偵測數據已存入 CSV，共 %d 筆紀錄。\n', size(finalTable, 1));
+else
+    fprintf('⚠ 警告：沒有偵測到任何隕石坑，請檢查門檻(Threshold)或圖片路徑。\n');
+end
+totalElapsed = toc; % 總計時結束
+avgTime = totalElapsed / numBench;
+estTotalHours = (avgTime * numFiles) / 3600;
+
+%% 3. 輸出效能報告
+fprintf('\n==========================================\n');
+fprintf('           📊 效能測試報告                \n');
+fprintf('==========================================\n');
+fprintf('測試樣本數: %d 張\n', numBench);
+fprintf('平均每張推論時間: %.4f 秒\n', totalInferenceTime / numBench);
+fprintf('平均每張後處理時間: %.4f 秒\n', totalPostProcessTime / numBench);
+fprintf('------------------------------------------\n');
+fprintf('平均總處理速度: %.3f 秒/張\n', avgTime);
+fprintf('預計處理全量數據 (%d 張) 所需時間:\n', numFiles);
+fprintf('%.2f 小時 (約 %.1f 分鐘)\n', estTotalHours, estTotalHours * 60);
+fprintf('==========================================\n');
+
+% 畫出最後一張跑完的結果
+figure;
+imshow(img); hold on;
+if ~isempty(radii)
+    viscircles(centers, radii, 'EdgeColor', 'r');
+    title(['測試檢查：偵測到 ', num2str(length(radii)), ' 個隕石坑']);
+else
+    title('測試檢查：此張圖未偵測到隕石坑');
+end
+
+% 建立一個資料夾專門放報告用的圖
+reportDir = 'C:\Users\jhan3\OneDrive\桌面\大二專題\Report_Images';
+if ~exist(reportDir, 'dir'), mkdir(reportDir); end
+
+% 假設你剛剛跑完 100 張測試，我們從中抓 5 張有結果的
+count = 0;
+for i = 1:length(allResults)
+    if ~isempty(allResults{i}) && count < 10
+        count = count + 1;
+        
+        % 重新畫圖並存檔
+        h = figure('Visible', 'off'); % 不顯示直接存
+        img = imread(fullfile(devDir, devFiles(i).name));
+        imshow(img, []); hold on;
+        
+        % 從 allResults{i} 提取 centers 和 radii
+        tempData = allResults{i};
+        res_centers = cell2mat(tempData(:, 2:3));
+        res_radii = cell2mat(tempData(:, 4));
+        
+        viscircles(res_centers, res_radii, 'EdgeColor', 'r');
+        title(['Sample Detection: ', num2str(size(tempData, 1)), ' craters']);
+        
+        saveas(h, fullfile(reportDir, ['Sample_', devFiles(i).name]));
+        close(h);
+    end
+end
+fprintf('報告用圖片已存入：%s\n', reportDir);
