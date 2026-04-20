@@ -40,9 +40,21 @@ for i=1:numBench
 
     % 後處理(Post-processing)
     tProcStart=tic;
-    binary_map=result_2d>0.02;
+    binary_map=result_2d>0.01;
+    se=strel('disk',3);
+    closed_map=imclose(binary_map,se);
+    filled_map=imfill(closed_map,'holes');
     clean_map=bwareaopen(binary_map,10);
-    [centers,radii]=imfindcircles(clean_map,[5,50],'sensitivity',0.92);
+    stats=regionprops(clean_map,'Centroid','EquivDiameter');
+    if ~isempty(stats)
+        centers=cat(1,stats.Centroid);
+        radii=(cat(1,stats.EquivDiameter)/2)*1.2;
+    else 
+        centers=[];
+        radii=[];
+    end
+
+    %[centers,radii]=imfindcircles(clean_map,[5,50],'sensitivity',0.92);
     totalPostProcessTime=totalPostProcessTime+toc(tProcStart);
     
     if ~isempty(radii)
@@ -96,7 +108,7 @@ end
 
 count=0;
 for i=1:length(allResults)
-    if ~isempty(allResults{i}) && count<10
+    if ~isempty(allResults{i})
         count=count+1;
 
         h=figure('Visible','off'); %圖片不顯示，直接存入檔案
