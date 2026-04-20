@@ -25,11 +25,13 @@ for i=1:numBench
     imgPath=fullfile(devDir,imgname);
     img=imread(imgPath);
 
-    if size(img,3)==3
-        img=rgb2gray(img);
+    img_adj=adapthisteq(img);% adapthisteq強化邊緣
+
+    if size(img_adj,3)==3
+        img=rgb2gray(img_adj);
     end
 
-    imginput=im2single(img);
+    imginput=im2single(img_adj);
 
     % 模型推論(Inference)
     tstart=tic;
@@ -128,7 +130,6 @@ for i=1:length(allResults)
 end
 
 fprintf('圖片已存入：%s\n',reportDir);
-
-整體準確率 (Precision): 21.34%
-整體召回率 (Recall): 8.03%
-F1-Score: 0.1167
+整體準確率 (Precision): 22.84%
+整體召回率 (Recall): 11.14%
+F1-Score: 0.1497
