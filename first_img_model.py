@@ -42,6 +42,25 @@ union = np.logical_or(gt, pred_bin).sum()
 iou = intersection / (union + 1e-8)
 dice = 2 * intersection / (gt.sum() + pred_bin.sum() + 1e-8)
 
+from skimage.morphology import dilation, disk
+
+# ===== 寬鬆版 IoU / Dice：允許邊緣誤差 =====
+tol = 2  # 允許 2 pixels 誤差，可以試 2, 3, 5
+se = disk(tol)
+
+gt_dilated = dilation(gt, se)
+pred_dilated = dilation(pred_bin, se)
+
+intersection_tol = np.logical_and(gt_dilated, pred_dilated).sum()
+union_tol = np.logical_or(gt_dilated, pred_dilated).sum()
+
+iou_tol = intersection_tol / (union_tol + 1e-8)
+dice_tol = 2 * intersection_tol / (gt_dilated.sum() + pred_dilated.sum() + 1e-8)
+
+print(f"Tolerance = {tol} pixels")
+print("Relaxed IoU =", iou_tol)
+print("Relaxed Dice =", dice_tol)
+
 print("threshold =", threshold)
 print("GT pixels =", gt.sum())
 print("Pred pixels =", pred_bin.sum())
@@ -83,6 +102,16 @@ overlay[..., 0] = pred_bin.astype(np.float32)  # red = Pred
 ax[1, 2].imshow(overlay)
 ax[1, 2].set_title(f"Overlap\nIoU={iou:.4f}, Dice={dice:.4f}")
 ax[1, 2].axis("off")
+
+overlay_tol = np.zeros((256, 256, 3), dtype=np.float32)
+overlay_tol[..., 1] = gt_dilated.astype(np.float32)        # green = GT expanded
+overlay_tol[..., 0] = pred_dilated.astype(np.float32)      # red = Pred expanded
+
+plt.figure(figsize=(6, 6))
+plt.imshow(overlay_tol)
+plt.title(f"Relaxed Overlap, tol={tol}px\nIoU={iou_tol:.4f}, Dice={dice_tol:.4f}")
+plt.axis("off")
+plt.show()
 
 plt.tight_layout()
 plt.show()
