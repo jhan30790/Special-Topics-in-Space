@@ -41,18 +41,20 @@ MAX_RESIDUAL = 12
 MERGE_CENTER_DIST = 35
 MERGE_RADIUS_DIFF = 35
 
+
 # ===== 左上邊界大圓專用參數 =====
-LEFT_TOP_X_LIMIT = 125
-LEFT_TOP_Y_LIMIT = 185
+# 這組比較保守，避免左上大圓被中間 crater 拉歪
+LEFT_TOP_X_LIMIT = 105
+LEFT_TOP_Y_LIMIT = 170
 
-LEFT_TOP_FIRST_X = 18     # 第一次只抓很靠左的點
-LEFT_TOP_FIRST_Y = 105    # 第一次只抓很靠上的點
+LEFT_TOP_FIRST_X = 22
+LEFT_TOP_FIRST_Y = 95
 
-LEFT_TOP_R_MIN = 55
-LEFT_TOP_R_MAX = 130
+LEFT_TOP_R_MIN = 60
+LEFT_TOP_R_MAX = 120
 
-LEFT_TOP_MAX_RESIDUAL = 8
-LEFT_TOP_RING_TOL = 4.0   # refined fit 時，允許離圓幾個 pixel
+LEFT_TOP_MAX_RESIDUAL = 10
+LEFT_TOP_RING_TOL = 3.0
 
 
 # =========================
@@ -108,12 +110,15 @@ def arc_fitting_from_mask(pred_bin):
             continue
 
         coords = region.coords
+
+        # region.coords 是 [row, col] = [y, x]
         y = coords[:, 0]
         x = coords[:, 1]
 
         bbox_h = region.bbox[2] - region.bbox[0]
         bbox_w = region.bbox[3] - region.bbox[1]
 
+        # 太短的弧線不要單獨 fitting，避免短雜訊變成假圓
         if max(bbox_h, bbox_w) < MIN_BBOX_SIZE:
             continue
 
@@ -128,7 +133,7 @@ def arc_fitting_from_mask(pred_bin):
         if r < R_MIN or r > R_MAX:
             continue
 
-        # 允許圓心在圖片外
+        # 允許圓心在圖片外，因為邊界 crater 可能只露出一部分
         if xc < -200 or xc > 456 or yc < -200 or yc > 456:
             continue
 
@@ -152,9 +157,10 @@ def arc_fitting_from_mask(pred_bin):
 # 工具：合併太相似的圓
 # =========================
 def merge_similar_circles(circles):
-    if len(circles) == 0:
+    if circles is None or len(circles) == 0:
         return []
 
+    # 優先保留弧線點多、residual 小的圓
     circles = sorted(circles, key=lambda c: (-c["arc_area"], c["residual"]))
 
     merged = []
@@ -173,6 +179,7 @@ def merge_similar_circles(circles):
             if d < MERGE_CENTER_DIST and dr < MERGE_RADIUS_DIFF:
                 duplicated = True
 
+                # 如果新的圓品質更好，就替換
                 if (c["arc_area"] > m["arc_area"]) and (c["residual"] < m["residual"] * 1.5):
                     m.update(c)
 
@@ -189,9 +196,10 @@ def merge_similar_circles(circles):
 # =========================
 def remove_nested_small_false_circles(circles):
     """
-    移除像 6 那種落在大 crater 內部的小假圓。
+    移除落在大 crater 內部的小假圓。
+    這裡條件有加強，讓像之前 6、7 那種內部假圓比較容易被濾掉。
     """
-    if len(circles) == 0:
+    if circles is None or len(circles) == 0:
         return []
 
     keep = []
@@ -217,8 +225,8 @@ def remove_nested_small_false_circles(circles):
 
             d = np.sqrt((xc - bx) ** 2 + (yc - by) ** 2)
 
-            # 小圓中心落在大圓內部，而且小圓相對很小
-            if d < br * 0.65 and r < br * 0.35:
+            # 加強版：中心落在大圓內部，就比較容易被視為假小圓
+            if d < br * 0.80 and r < br * 0.45:
                 is_false_nested = True
                 break
 
@@ -245,7 +253,7 @@ def add_left_top_boundary_big_circle(pred_bin, circles):
 
     # -----------------------------
     # Step 1：先只取左上區域，而且只取很靠上 or 很靠左的點
-    # 這樣可以避免下面那顆大 crater 把圓心拉歪
+    # 避免下面那顆大 crater 把圓心拉歪
     # -----------------------------
     sel1 = (
         (xs < LEFT_TOP_X_LIMIT) &
@@ -278,7 +286,6 @@ def add_left_top_boundary_big_circle(pred_bin, circles):
     xc1, yc1, r1, residual1 = fit1
     print(f"coarse fit -> xc={xc1:.2f}, yc={yc1:.2f}, r={r1:.2f}, residual={residual1:.2f}")
 
-    # 粗略結果先做基本過濾
     if r1 < LEFT_TOP_R_MIN or r1 > LEFT_TOP_R_MAX:
         print("原因：coarse fit 半徑不合理")
         print("==================================\n")
@@ -315,7 +322,7 @@ def add_left_top_boundary_big_circle(pred_bin, circles):
     print(f"refined fit -> xc={xc:.2f}, yc={yc:.2f}, r={r:.2f}, residual={residual:.2f}")
 
     # -----------------------------
-    # Step 3：最後再做條件限制
+    # Step 3：最後條件限制
     # -----------------------------
     if r < LEFT_TOP_R_MIN or r > LEFT_TOP_R_MAX:
         print("原因：refined fit 半徑不合理")
@@ -337,6 +344,7 @@ def add_left_top_boundary_big_circle(pred_bin, circles):
     for c in circles:
         d = np.sqrt((xc - c["x_center"]) ** 2 + (yc - c["y_center"]) ** 2)
         dr = abs(r - c["radius"])
+
         if d < 20 and dr < 20:
             print("原因：和既有圓太接近，不重複加入")
             print("==================================\n")
@@ -360,6 +368,7 @@ def add_left_top_boundary_big_circle(pred_bin, circles):
     print("==================================\n")
 
     return circles
+
 
 # =========================
 # 讀模型
@@ -451,9 +460,8 @@ final_circles = add_left_top_boundary_big_circle(pred_bin, final_circles)
 # 再合併一次，避免重複
 final_circles = merge_similar_circles(final_circles)
 
-# 移除像 6 那種在大圓內的小假圓
+# 移除在大圓內的小假圓
 final_circles = remove_nested_small_false_circles(final_circles)
-
 
 cx = np.array([c["x_center"] for c in final_circles])
 cy = np.array([c["y_center"] for c in final_circles])
