@@ -16,7 +16,7 @@ from skimage.measure import label, regionprops
 dev_images_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_images.hdf5"
 model_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
 
-output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\single_result_output"
+output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\report_analysis_output"
 os.makedirs(output_dir, exist_ok=True)
 
 # 測試第幾張
@@ -26,35 +26,19 @@ idx = 0
 # =========================
 # 參數設定
 # =========================
+THRESHOLD_RATIOS = [0.12, 0.13, 0.16, 0.18, 0.22, 0.26]
 
-THRESHOLD_RATIOS = [0.13, 0.16, 0.18, 0.22]
-
-MIN_OBJ_SIZE = 10
-MIN_ARC_POINTS = 6
+MIN_OBJ_SIZE = 6
+MIN_ARC_POINTS = 5
 
 R_MIN = 4
 R_MAX = 180
 
-MIN_BBOX_SIZE = 8
-MAX_RESIDUAL = 12
+MIN_BBOX_SIZE = 5
+MAX_RESIDUAL = 10
 
 MERGE_CENTER_DIST = 35
 MERGE_RADIUS_DIFF = 35
-
-
-# ===== 左上邊界大圓專用參數 =====
-# 這組比較保守，避免左上大圓被中間 crater 拉歪
-LEFT_TOP_X_LIMIT = 105
-LEFT_TOP_Y_LIMIT = 170
-
-LEFT_TOP_FIRST_X = 22
-LEFT_TOP_FIRST_Y = 95
-
-LEFT_TOP_R_MIN = 60
-LEFT_TOP_R_MAX = 120
-
-LEFT_TOP_MAX_RESIDUAL = 10
-LEFT_TOP_RING_TOL = 3.0
 
 
 # =========================
@@ -133,7 +117,7 @@ def arc_fitting_from_mask(pred_bin):
         if r < R_MIN or r > R_MAX:
             continue
 
-        # 允許圓心在圖片外，因為邊界 crater 可能只露出一部分
+        # 允許圓心稍微在圖片外，因為邊界 crater 可能只露出一部分
         if xc < -200 or xc > 456 or yc < -200 or yc > 456:
             continue
 
@@ -179,7 +163,6 @@ def merge_similar_circles(circles):
             if d < MERGE_CENTER_DIST and dr < MERGE_RADIUS_DIFF:
                 duplicated = True
 
-                # 如果新的圓品質更好，就替換
                 if (c["arc_area"] > m["arc_area"]) and (c["residual"] < m["residual"] * 1.5):
                     m.update(c)
 
@@ -192,12 +175,12 @@ def merge_similar_circles(circles):
 
 
 # =========================
-# 工具：移除在大圓內部的小假圓
+# 工具：移除大圓內部的小假圓
 # =========================
 def remove_nested_small_false_circles(circles):
     """
-    移除落在大 crater 內部的小假圓。
-    這裡條件有加強，讓像之前 6、7 那種內部假圓比較容易被濾掉。
+    移除落在大 crater 內部的假小圓。
+    但如果小圓接近大圓邊界 rim，則保留。
     """
     if circles is None or len(circles) == 0:
         return []
@@ -219,14 +202,21 @@ def remove_nested_small_false_circles(circles):
             by = big["y_center"]
             br = big["radius"]
 
-            # 只用比自己大很多的圓判斷
-            if br < r * 2.2:
+            # 只拿明顯比較大的圓來判斷
+            if br < r * 2.5:
                 continue
 
             d = np.sqrt((xc - bx) ** 2 + (yc - by) ** 2)
 
-            # 加強版：中心落在大圓內部，就比較容易被視為假小圓
-            if d < br * 0.80 and r < br * 0.45:
+            # 小圓中心到大圓邊界的距離
+            rim_dist = abs(d - br)
+
+            # 如果小圓中心接近大圓 rim，可能是真實附著在邊界上的小 crater，不刪
+            if rim_dist < max(4, 0.35 * r):
+                continue
+
+            # 如果小圓很深地落在大圓內部，才刪掉
+            if d < br * 0.72 and r < br * 0.35:
                 is_false_nested = True
                 break
 
@@ -234,140 +224,6 @@ def remove_nested_small_false_circles(circles):
             keep.append(c)
 
     return keep
-
-
-# =========================
-# 工具：補抓左上邊界大圓
-# =========================
-def add_left_top_boundary_big_circle(pred_bin, circles):
-    """
-    專門補抓左上角邊界大圓。
-    改良版做法：
-    1) 先只取「很靠上 / 很靠左」的點做粗略 fit
-    2) 再根據粗略 fit，挑選貼近該圓的點做 refined fit
-    """
-    if circles is None:
-        circles = []
-
-    ys, xs = np.where(pred_bin)
-
-    # -----------------------------
-    # Step 1：先只取左上區域，而且只取很靠上 or 很靠左的點
-    # 避免下面那顆大 crater 把圓心拉歪
-    # -----------------------------
-    sel1 = (
-        (xs < LEFT_TOP_X_LIMIT) &
-        (ys < LEFT_TOP_Y_LIMIT) &
-        (
-            (xs < LEFT_TOP_FIRST_X) |
-            (ys < LEFT_TOP_FIRST_Y)
-        )
-    )
-
-    xs1 = xs[sel1]
-    ys1 = ys[sel1]
-
-    print("\n===== Left-top boundary debug =====")
-    print("coarse candidate points =", len(xs1))
-
-    if len(xs1) < 12:
-        print("原因：左上候選點太少")
-        print("==================================\n")
-        return circles
-
-    points1 = np.column_stack([xs1, ys1])
-
-    fit1 = fit_circle_least_squares(points1)
-    if fit1 is None:
-        print("原因：第一次 coarse fit 失敗")
-        print("==================================\n")
-        return circles
-
-    xc1, yc1, r1, residual1 = fit1
-    print(f"coarse fit -> xc={xc1:.2f}, yc={yc1:.2f}, r={r1:.2f}, residual={residual1:.2f}")
-
-    if r1 < LEFT_TOP_R_MIN or r1 > LEFT_TOP_R_MAX:
-        print("原因：coarse fit 半徑不合理")
-        print("==================================\n")
-        return circles
-
-    # -----------------------------
-    # Step 2：refined fit
-    # 只保留「貼近粗略圓」的點，再重 fit 一次
-    # -----------------------------
-    dist_all = np.sqrt((xs - xc1) ** 2 + (ys - yc1) ** 2)
-
-    sel2 = (
-        (xs < LEFT_TOP_X_LIMIT) &
-        (ys < LEFT_TOP_Y_LIMIT) &
-        (np.abs(dist_all - r1) < LEFT_TOP_RING_TOL)
-    )
-
-    xs2 = xs[sel2]
-    ys2 = ys[sel2]
-
-    print("refined candidate points =", len(xs2))
-
-    if len(xs2) >= 12:
-        points2 = np.column_stack([xs2, ys2])
-        fit2 = fit_circle_least_squares(points2)
-
-        if fit2 is not None:
-            xc, yc, r, residual = fit2
-        else:
-            xc, yc, r, residual = xc1, yc1, r1, residual1
-    else:
-        xc, yc, r, residual = xc1, yc1, r1, residual1
-
-    print(f"refined fit -> xc={xc:.2f}, yc={yc:.2f}, r={r:.2f}, residual={residual:.2f}")
-
-    # -----------------------------
-    # Step 3：最後條件限制
-    # -----------------------------
-    if r < LEFT_TOP_R_MIN or r > LEFT_TOP_R_MAX:
-        print("原因：refined fit 半徑不合理")
-        print("==================================\n")
-        return circles
-
-    # 左上邊界大圓通常圓心不會跑到太右太下
-    if xc > 90 or yc > 150:
-        print("原因：圓心位置太偏右/偏下，不像左上邊界大圓")
-        print("==================================\n")
-        return circles
-
-    if residual > LEFT_TOP_MAX_RESIDUAL:
-        print("原因：residual 太大")
-        print("==================================\n")
-        return circles
-
-    # 如果跟現有某個圓太像，就不要重複加
-    for c in circles:
-        d = np.sqrt((xc - c["x_center"]) ** 2 + (yc - c["y_center"]) ** 2)
-        dr = abs(r - c["radius"])
-
-        if d < 20 and dr < 20:
-            print("原因：和既有圓太接近，不重複加入")
-            print("==================================\n")
-            return circles
-
-    new_circle = {
-        "x_center": float(xc),
-        "y_center": float(yc),
-        "radius": float(r),
-        "diameter": float(r * 2),
-        "arc_area": int(len(xs2)) if len(xs2) >= 12 else int(len(xs1)),
-        "residual": float(residual),
-        "method": "left_top_boundary_arc",
-        "threshold_ratio": None,
-        "threshold": None
-    }
-
-    circles.append(new_circle)
-
-    print("成功：已補上左上邊界大圓")
-    print("==================================\n")
-
-    return circles
 
 
 # =========================
@@ -393,6 +249,7 @@ img_float = img.astype("float32")
 img_norm = (img_float - img_float.min()) / (img_float.max() - img_float.min() + 1e-8)
 
 x = img_norm.reshape(1, 256, 256, 1)
+
 pred_raw = model.predict(x, verbose=0)
 
 if pred_raw.ndim == 4:
@@ -404,7 +261,7 @@ else:
 
 
 # =========================
-# 強化影像：只顯示用
+# 強化影像：只顯示用，不餵給模型
 # =========================
 try:
     from skimage import exposure
@@ -432,7 +289,7 @@ for ratio in THRESHOLD_RATIOS:
 
     temp_bin = pred > threshold
 
-    # 保守版：closing 用 disk(2)，不要 dilation
+    # closing 補一點點斷裂，但不要 dilation，避免假圓變多
     temp_bin = binary_closing(temp_bin, footprint=disk(2))
     temp_bin = remove_small_objects(temp_bin, min_size=MIN_OBJ_SIZE)
 
@@ -450,18 +307,15 @@ pred_bin = np.logical_or.reduce(all_pred_bins)
 
 
 # =========================
-# 合併 + 補抓邊界大圓 + 移除假小圓
+# 報告分析用：只使用泛用 arc fitting，不做人工邊界補抓
 # =========================
 final_circles = merge_similar_circles(all_arc_circles)
 
-# 補抓左上邊界大圓
-final_circles = add_left_top_boundary_big_circle(pred_bin, final_circles)
-
-# 再合併一次，避免重複
-final_circles = merge_similar_circles(final_circles)
-
-# 移除在大圓內的小假圓
+# 移除大圓內部假小圓
 final_circles = remove_nested_small_false_circles(final_circles)
+
+# 最後再合併一次
+final_circles = merge_similar_circles(final_circles)
 
 cx = np.array([c["x_center"] for c in final_circles])
 cy = np.array([c["y_center"] for c in final_circles])
@@ -477,6 +331,10 @@ union = np.logical_or(gt, pred_bin).sum()
 iou = intersection / (union + 1e-8)
 dice = 2 * intersection / (gt.sum() + pred_bin.sum() + 1e-8)
 
+
+# =========================
+# Relaxed IoU / Dice
+# =========================
 tol = 2
 se = disk(tol)
 
@@ -511,8 +369,13 @@ for i, c in enumerate(final_circles):
 
 results_df = pd.DataFrame(results)
 
+
+# =========================
+# 印出結果
+# =========================
 print("\n==============================")
 print(f"Image index = {idx}")
+print("Post-processing mode = arc fitting only, no manual boundary correction")
 print(f"Detected craters = {len(results_df)}")
 print(f"IoU = {iou:.4f}, Dice = {dice:.4f}")
 print(f"Relaxed IoU = {iou_tol:.4f}, Relaxed Dice = {dice_tol:.4f}")
@@ -523,7 +386,11 @@ if len(results_df) > 0:
 else:
     print("No circles detected.")
 
-csv_path = os.path.join(output_dir, f"arcfit_boundary_fixed_craters_info_{idx:05d}.csv")
+
+# =========================
+# 存 CSV
+# =========================
+csv_path = os.path.join(output_dir, f"report_arcfit_craters_info_{idx:05d}.csv")
 results_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 print(f"CSV saved: {csv_path}")
 
@@ -581,12 +448,14 @@ for i in range(len(radii)):
         ha="center",
         va="center"
     )
+
 ax[1, 1].set_title(f"Arc fitting: {len(radii)} craters")
 ax[1, 1].axis("off")
 
 # 7 GT + ArcFit
 ax[1, 2].imshow(img_enhanced, cmap="gray")
 ax[1, 2].contour(gt, levels=[0.5], colors="lime", linewidths=1.5)
+
 for i in range(len(radii)):
     circ = Circle((cx[i], cy[i]), radii[i], fill=False, edgecolor="red", linewidth=2)
     ax[1, 2].add_patch(circ)
@@ -599,6 +468,7 @@ for i in range(len(radii)):
         ha="center",
         va="center"
     )
+
 ax[1, 2].set_title("GT(green) + ArcFit(red)")
 ax[1, 2].axis("off")
 
@@ -609,8 +479,27 @@ ax[1, 3].axis("off")
 
 plt.tight_layout()
 
-fig_path = os.path.join(output_dir, f"arcfit_boundary_fixed_result_plot_{idx:05d}.png")
+fig_path = os.path.join(output_dir, f"report_arcfit_result_plot_{idx:05d}.png")
 plt.savefig(fig_path, dpi=200, bbox_inches="tight")
 print(f"Figure saved: {fig_path}")
+
+plt.show()
+
+
+# =========================
+# 額外 relaxed overlap 圖
+# =========================
+overlay_tol = np.zeros((256, 256, 3), dtype=np.float32)
+overlay_tol[..., 1] = gt_dilated.astype(np.float32)
+overlay_tol[..., 0] = pred_dilated.astype(np.float32)
+
+plt.figure(figsize=(6, 6))
+plt.imshow(overlay_tol)
+plt.title(f"Relaxed Overlap, tol={tol}px\nIoU={iou_tol:.4f}, Dice={dice_tol:.4f}")
+plt.axis("off")
+
+relaxed_path = os.path.join(output_dir, f"report_relaxed_overlap_{idx:05d}.png")
+plt.savefig(relaxed_path, dpi=200, bbox_inches="tight")
+print(f"Relaxed overlap saved: {relaxed_path}")
 
 plt.show()
