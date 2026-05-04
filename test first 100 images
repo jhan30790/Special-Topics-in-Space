@@ -17,10 +17,10 @@ dev_images_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\
 model_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
 gt_csv_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\Ground_Truth_Dev_100.csv"
 
-output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_img_100"
+output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_img_100_2"
 os.makedirs(output_dir, exist_ok=True)
 
-NUM_IMAGES = 100
+NUM_IMAGES = 10
 DEBUG_LEFT_TOP = False
 
 # 如果你想忽略太小的 GT crater，可以改成 10
@@ -60,6 +60,31 @@ LEFT_TOP_R_MAX = 360
 LEFT_TOP_MAX_RESIDUAL = 70
 LEFT_TOP_RING_TOL = 25.0
 
+# =========================
+# 中大型 crater 參數
+# =========================
+large_threshold_ratios = [0.13, 0.16, 0.18, 0.22]
+
+large_min_obj_size = 10
+large_min_arc_points = 6
+large_min_bbox_size = 8
+large_R_min = 10
+large_R_max = 600
+large_max_residual = 10
+
+
+# =========================
+# 小型 crater 參數
+# =========================
+small_threshold_ratios = [0.08, 0.10, 0.12, 0.13]
+
+small_min_obj_size = 3
+small_min_arc_points = 3
+small_min_bbox_size = 3
+small_R_min = 3
+small_R_max = 18
+small_max_residual = 3.5
+
 
 # =========================
 # 工具：圓擬合
@@ -94,24 +119,33 @@ def fit_circle_least_squares(points):
     return xc, yc, r, residual
 
 
-def arc_fitting_from_mask(pred_bin):
+def arc_fitting_from_mask(
+    pred_bin,
+    min_arc_points_use,
+    min_bbox_size_use,
+    R_min_use,
+    R_max_use,
+    max_residual_use,
+    method_name="arc_fit"
+):
     labeled = label(pred_bin)
     regions = regionprops(labeled)
 
     circles = []
 
     for region in regions:
-        if region.area < min_arc_points:
+        if region.area < min_arc_points_use:
             continue
 
         coords = region.coords
+
         y = coords[:, 0]
         x = coords[:, 1]
 
         bbox_h = region.bbox[2] - region.bbox[0]
         bbox_w = region.bbox[3] - region.bbox[1]
 
-        if max(bbox_h, bbox_w) < min_bbox_size:
+        if max(bbox_h, bbox_w) < min_bbox_size_use:
             continue
 
         points = np.column_stack([x, y])
@@ -122,13 +156,13 @@ def arc_fitting_from_mask(pred_bin):
 
         xc, yc, r, residual = fit
 
-        if r < R_min or r > R_max:
+        if r < R_min_use or r > R_max_use:
             continue
 
         if xc < -200 or xc > 456 or yc < -200 or yc > 456:
             continue
 
-        if residual > max_residual:
+        if residual > max_residual_use:
             continue
 
         circles.append({
@@ -138,11 +172,55 @@ def arc_fitting_from_mask(pred_bin):
             "diameter": float(r * 2),
             "arc_area": int(region.area),
             "residual": float(residual),
-            "method": "arc_fit"
+            "method": method_name
         })
 
     return circles
 
+def detect_craters_by_params(
+    pred,
+    threshold_ratios_use,
+    min_obj_size_use,
+    min_arc_points_use,
+    min_bbox_size_use,
+    R_min_use,
+    R_max_use,
+    max_residual_use,
+    method_name
+):
+    all_circles = []
+    all_bins = []
+
+    for ratio in threshold_ratios_use:
+        threshold = ratio * pred.max()
+
+        temp_bin = pred > threshold
+        temp_bin = binary_closing(temp_bin, footprint=disk(2))
+        temp_bin = remove_small_objects(temp_bin, min_size=min_obj_size_use)
+
+        temp_circles = arc_fitting_from_mask(
+            temp_bin,
+            min_arc_points_use,
+            min_bbox_size_use,
+            R_min_use,
+            R_max_use,
+            max_residual_use,
+            method_name=method_name
+        )
+
+        for c in temp_circles:
+            c["threshold_ratio"] = ratio
+            c["threshold"] = float(threshold)
+
+        all_circles.extend(temp_circles)
+        all_bins.append(temp_bin)
+
+    if len(all_bins) > 0:
+        pred_bin = np.logical_or.reduce(all_bins)
+    else:
+        pred_bin = np.zeros_like(pred, dtype=bool)
+
+    return all_circles, pred_bin
 
 def merge_similar_circles(circles):
     if circles is None or len(circles) == 0:
@@ -197,12 +275,19 @@ def remove_nested_small_false_circles(circles):
             by = big["y_center"]
             br = big["radius"]
 
-            if br < r * 2.2:
+            if br < r * 3.0:
                 continue
 
             d = np.sqrt((xc - bx) ** 2 + (yc - by) ** 2)
 
-            if d < br * 0.80 and r < br * 0.45:
+            rim_dist = abs(d - br)
+
+            # 如果小圓靠近大圓 rim，就保留
+            if rim_dist < max(5, 0.5 * r):
+                continue
+
+            # 只有很深地落在大圓內部，而且非常小，才刪
+            if d < br * 0.45 and r < br * 0.20:
                 is_false_nested = True
                 break
 
@@ -210,7 +295,6 @@ def remove_nested_small_false_circles(circles):
             keep.append(c)
 
     return keep
-
 
 def add_left_top_boundary_big_circle(pred_bin, circles):
     if circles is None:
@@ -441,34 +525,60 @@ with h5py.File(dev_images_path, "r") as f:
         all_arc_circles = []
         all_pred_bins = []
 
-        for ratio in threshold_ratios:
-            threshold = ratio * pred.max()
+# =========================
+# 第一段：偵測中大型 crater
+# =========================
+        # =========================
+        # 第一段：偵測中大型 crater
+        # =========================
+        large_circles, large_bin = detect_craters_by_params(
+            pred,
+            large_threshold_ratios,
+            large_min_obj_size,
+            large_min_arc_points,
+            large_min_bbox_size,
+            large_R_min,
+            large_R_max,
+            large_max_residual,
+            method_name="large_arc_fit"
+        )
 
-            temp_bin = pred > threshold
-            temp_bin = binary_closing(temp_bin, footprint=disk(2))
-            temp_bin = remove_small_objects(temp_bin, min_size=min_obj_size)
+        # =========================
+        # 第二段：偵測小型 crater
+        # =========================
+        small_circles, small_bin = detect_craters_by_params(
+            pred,
+            small_threshold_ratios,
+            small_min_obj_size,
+            small_min_arc_points,
+            small_min_bbox_size,
+            small_R_min,
+            small_R_max,
+            small_max_residual,
+            method_name="small_arc_fit"
+        )
 
-            temp_circles = arc_fitting_from_mask(temp_bin)
+        # 合併 binary mask，畫圖用
+        pred_bin = np.logical_or(large_bin, small_bin)
 
-            for c in temp_circles:
-                c["threshold_ratio"] = ratio
-                c["threshold"] = float(threshold)
-
-            all_arc_circles.extend(temp_circles)
-            all_pred_bins.append(temp_bin)
-
-        pred_bin = np.logical_or.reduce(all_pred_bins)
+        # 合併候選圓
+        all_arc_circles = large_circles + small_circles
 
         final_circles = merge_similar_circles(all_arc_circles)
+
+        # 左上大圓補抓，如果你還想保留
         final_circles = add_left_top_boundary_big_circle(pred_bin, final_circles)
+
         final_circles = merge_similar_circles(final_circles)
+
+        # 這個函式先不要太兇，因為會刪掉大坑裡的小坑
         final_circles = remove_nested_small_false_circles(final_circles)
+
         final_circles = merge_similar_circles(final_circles)
 
         cx = np.array([c["x_center"] for c in final_circles])
         cy = np.array([c["y_center"] for c in final_circles])
         radii = np.array([c["radius"] for c in final_circles])
-
         # 記錄預測圓
         for i, c in enumerate(final_circles):
             all_results.append({
