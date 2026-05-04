@@ -4,6 +4,7 @@ import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import gc
 
 from matplotlib.patches import Circle
 from skimage.morphology import disk, binary_closing, remove_small_objects
@@ -44,6 +45,7 @@ max_residual = 10
 merge_center_dist = 35
 merge_radius_diff = 35
 
+GT_DRAW_RADIUS_MIN = 8
 
 # =========================
 # 左上大圓參數
@@ -403,7 +405,7 @@ def crater_level_eval(gt_df, idx, pred_circles):
 
     if GT_DIAMETER_MIN > 0:
         gt_sub = gt_sub[gt_sub["Diameter (pix)"] >= GT_DIAMETER_MIN]
-        # pred_circles_filtered=[c for c in pred_circles if c["diameter"]>=GT_DIAMETER_MIN]
+
     gt_circles = []
 
     for _, row in gt_sub.iterrows():
@@ -412,6 +414,8 @@ def crater_level_eval(gt_df, idx, pred_circles):
             "y_center": float(row["y"]),
             "radius": float(row["Diameter (pix)"]) / 2
         })
+
+    pred_circles = pred_circles if pred_circles is not None else []
 
     gt_matched = [False] * len(gt_circles)
     pred_matched = [False] * len(pred_circles)
@@ -452,7 +456,7 @@ def crater_level_eval(gt_df, idx, pred_circles):
     FP = len(pred_circles) - TP
     FN = len(gt_circles) - sum(gt_matched)
 
-    accuracy = TP / (TP+FP+FN+1e-8)
+    accuracy = TP / (TP + FP + FN + 1e-8)
     precision = TP / (TP + FP + 1e-8)
     recall = TP / (TP + FN + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
@@ -463,7 +467,7 @@ def crater_level_eval(gt_df, idx, pred_circles):
         "TP": TP,
         "FP": FP,
         "FN": FN,
-        "Accuracy":accuracy,
+        "Accuracy": accuracy,
         "Precision": precision,
         "Recall": recall,
         "F1_score": f1
@@ -488,7 +492,7 @@ total_FN = 0
 
 
 # =========================
-# 跑前 100 張
+# 跑前 NUM_IMAGES 張
 # =========================
 with h5py.File(dev_images_path, "r") as f:
     total_imgs = f["input_images"].shape[0]
@@ -500,6 +504,9 @@ with h5py.File(dev_images_path, "r") as f:
         img = f["input_images"][idx]
         mask = f["target_masks"][idx]
 
+        # =========================
+        # 前處理
+        # =========================
         img_float = img.astype("float32")
         img_norm = (img_float - img_float.min()) / (img_float.max() - img_float.min() + 1e-8)
 
@@ -513,6 +520,9 @@ with h5py.File(dev_images_path, "r") as f:
         else:
             raise ValueError(f"模型輸出維度異常：{pred_raw.shape}")
 
+        # =========================
+        # 強化影像，只拿來顯示
+        # =========================
         try:
             from skimage import exposure
             img_enhanced = exposure.equalize_adapthist(img_norm, clip_limit=0.03)
@@ -522,12 +532,6 @@ with h5py.File(dev_images_path, "r") as f:
 
         gt = mask > 0
 
-        all_arc_circles = []
-        all_pred_bins = []
-
-# =========================
-# 第一段：偵測中大型 crater
-# =========================
         # =========================
         # 第一段：偵測中大型 crater
         # =========================
@@ -566,12 +570,12 @@ with h5py.File(dev_images_path, "r") as f:
 
         final_circles = merge_similar_circles(all_arc_circles)
 
-        # 左上大圓補抓，如果你還想保留
+        # 左上大圓補抓
         final_circles = add_left_top_boundary_big_circle(pred_bin, final_circles)
 
         final_circles = merge_similar_circles(final_circles)
 
-        # 這個函式先不要太兇，因為會刪掉大坑裡的小坑
+        # 移除明顯假小圓
         final_circles = remove_nested_small_false_circles(final_circles)
 
         final_circles = merge_similar_circles(final_circles)
@@ -579,7 +583,10 @@ with h5py.File(dev_images_path, "r") as f:
         cx = np.array([c["x_center"] for c in final_circles])
         cy = np.array([c["y_center"] for c in final_circles])
         radii = np.array([c["radius"] for c in final_circles])
+
+        # =========================
         # 記錄預測圓
+        # =========================
         for i, c in enumerate(final_circles):
             all_results.append({
                 "image_index": idx,
@@ -596,7 +603,9 @@ with h5py.File(dev_images_path, "r") as f:
                 "threshold": c.get("threshold", None)
             })
 
-        # crater-level evaluation
+        # =========================
+        # Crater-level evaluation
+        # =========================
         eval_result = crater_level_eval(gt_df, idx, final_circles)
 
         total_TP += eval_result["TP"]
@@ -612,55 +621,120 @@ with h5py.File(dev_images_path, "r") as f:
         print(f"GT craters   = {eval_result['GT_craters']}")
         print(f"Pred craters = {eval_result['Pred_craters']}")
         print(f"TP={eval_result['TP']}, FP={eval_result['FP']}, FN={eval_result['FN']}")
-        print(f"Accuracy={eval_result['Accuracy']:.4f},Precision={eval_result['Precision']:.4f}, Recall={eval_result['Recall']:.4f}, F1={eval_result['F1_score']:.4f}")
+        print(
+            f"Accuracy={eval_result['Accuracy']:.4f}, "
+            f"Precision={eval_result['Precision']:.4f}, "
+            f"Recall={eval_result['Recall']:.4f}, "
+            f"F1={eval_result['F1_score']:.4f}"
+        )
 
+        # =========================
+        # 取得這張圖要畫的 GT circles
+        # =========================
+        possible_names = [
+            f"tile_{idx:04d}.png",
+            f"dev_image_{idx:05d}.png",
+            f"img_{idx:05d}.png"
+        ]
+
+        gt_sub_draw = gt_df[gt_df["FileName"].isin(possible_names)].copy()
+        gt_sub_draw["radius"] = gt_sub_draw["Diameter (pix)"] / 2
+        gt_sub_draw = gt_sub_draw[gt_sub_draw["radius"] >= GT_DRAW_RADIUS_MIN]
+
+        # =========================
         # 畫圖
-        fig, ax = plt.subplots(2, 2, figsize=(10, 10))
+        # =========================
+        fig, ax = plt.subplots(2, 2, figsize=(8, 8))
 
+        # 1. 原圖
         ax[0, 0].imshow(img_enhanced, cmap="gray")
         ax[0, 0].set_title("image")
         ax[0, 0].axis("off")
 
+        # 2. GT 綠圈，只畫半徑夠大的
         ax[0, 1].imshow(img_enhanced, cmap="gray")
-        ax[0, 1].contour(gt, levels=[0.5], colors="lime", linewidths=1.5)
+
+        for _, row in gt_sub_draw.iterrows():
+            circ = Circle(
+                (row["x"], row["y"]),
+                row["radius"],
+                fill=False,
+                edgecolor="lime",
+                linewidth=1.5
+            )
+            ax[0, 1].add_patch(circ)
+
         ax[0, 1].set_title("GT")
         ax[0, 1].axis("off")
 
+        # 3. Pred 紅圈
         ax[1, 0].imshow(img_enhanced, cmap="gray")
+
         for i in range(len(radii)):
-            circ = Circle((cx[i], cy[i]), radii[i], fill=False, edgecolor="red", linewidth=2)
+            circ = Circle(
+                (cx[i], cy[i]),
+                radii[i],
+                fill=False,
+                edgecolor="red",
+                linewidth=2
+            )
             ax[1, 0].add_patch(circ)
             ax[1, 0].text(
-                cx[i], cy[i], str(i + 1),
+                cx[i],
+                cy[i],
+                str(i + 1),
                 color="yellow",
                 fontsize=10,
                 ha="center",
                 va="center"
             )
+
         ax[1, 0].set_title(f"Arc fitting: {len(radii)} craters")
         ax[1, 0].axis("off")
 
+        # 4. GT + Pred
         ax[1, 1].imshow(img_enhanced, cmap="gray")
-        ax[1, 1].contour(gt, levels=[0.5], colors="lime", linewidths=1.5)
+
+        # 畫 GT 綠圈
+        for _, row in gt_sub_draw.iterrows():
+            circ = Circle(
+                (row["x"], row["y"]),
+                row["radius"],
+                fill=False,
+                edgecolor="lime",
+                linewidth=1.5
+            )
+            ax[1, 1].add_patch(circ)
+
+        # 畫 Pred 紅圈
         for i in range(len(radii)):
-            circ = Circle((cx[i], cy[i]), radii[i], fill=False, edgecolor="red", linewidth=2)
+            circ = Circle(
+                (cx[i], cy[i]),
+                radii[i],
+                fill=False,
+                edgecolor="red",
+                linewidth=2
+            )
             ax[1, 1].add_patch(circ)
             ax[1, 1].text(
-                cx[i], cy[i], str(i + 1),
+                cx[i],
+                cy[i],
+                str(i + 1),
                 color="yellow",
                 fontsize=10,
                 ha="center",
                 va="center"
             )
+
         ax[1, 1].set_title("GT(green) + ArcFit(red)")
         ax[1, 1].axis("off")
 
         plt.tight_layout()
 
         fig_path = os.path.join(output_dir, f"arcfit_boundary_fixed_result_plot_{idx:05d}.png")
-        plt.savefig(fig_path, dpi=200, bbox_inches="tight")
+        fig.savefig(fig_path, dpi=120, bbox_inches="tight")
         plt.close(fig)
-
+        gc.collect()
 
 # =========================
 # 存 CSV
@@ -676,7 +750,7 @@ summary_df.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
 
 
 # =========================
-# 100 張總結果
+# 總結果
 # =========================
 total_accuracy = total_TP / (total_TP + total_FP + total_FN + 1e-8)
 total_precision = total_TP / (total_TP + total_FP + 1e-8)
@@ -697,14 +771,14 @@ total_csv_path = os.path.join(output_dir, "arcfit_total_precision_recall_f1_firs
 total_df.to_csv(total_csv_path, index=False, encoding="utf-8-sig")
 
 print("\n==============================")
-print("前 100 張處理完成！")
+print(f"前 {NUM_IMAGES} 張處理完成！")
 print(f"所有 crater 結果 CSV：{all_csv_path}")
 print(f"每張 crater-level summary CSV：{summary_csv_path}")
 print(f"總體 Precision/Recall/F1 CSV：{total_csv_path}")
 print(f"圖片輸出資料夾：{output_dir}")
 print("==============================")
 
-print("\n========== 前 100 張總體 Crater-level Evaluation ==========")
+print(f"\n========== 前 {NUM_IMAGES} 張總體 Crater-level Evaluation ==========")
 print(f"Total TP = {total_TP}")
 print(f"Total FP = {total_FP}")
 print(f"Total FN = {total_FN}")
