@@ -21,11 +21,11 @@ gt_csv_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\Ground_Truth_Dev_100
 output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_img_100_2"
 os.makedirs(output_dir, exist_ok=True)
 
-NUM_IMAGES = 10
+NUM_IMAGES = 100
 DEBUG_LEFT_TOP = False
 
 # 如果你想忽略太小的 GT crater，可以改成 10
-GT_DIAMETER_MIN =10
+GT_DIAMETER_MIN =8
 
 
 # =========================
