@@ -1,516 +1,92 @@
 import os
+import sys
 import h5py
-import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas as pd
+import tensorflow as tf
 import gc
 
 from matplotlib.patches import Circle
-from skimage.morphology import disk, binary_closing, remove_small_objects
-from skimage.measure import label, regionprops
 
+# =============================================================
+# 把 DeepMoon repo 加入 Python path（請改成你的實際路徑）
+# =============================================================
+DEEPMOON_DIR = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master"
+sys.path.insert(0, DEEPMOON_DIR)
 
-# =========================
+import utils.template_match_target as tmt
+
+# =============================================================
 # 路徑設定
-# =========================
-dev_images_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_images.hdf5"
-model_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
-gt_csv_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\Ground_Truth_Dev_100.csv"
+# =============================================================
+dev_images_path  = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_images.hdf5"
+dev_craters_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_craters.hdf5"
+model_path       = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
 
-output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_img_100_2"
+output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_deepmoon_eval"
 os.makedirs(output_dir, exist_ok=True)
 
+# =============================================================
+# 執行張數
+# =============================================================
 NUM_IMAGES = 100
-DEBUG_LEFT_TOP = False
 
-# 如果你想忽略太小的 GT crater，可以改成 10
-GT_DIAMETER_MIN =8
-
-
-# =========================
-# 參數
-# =========================
-threshold_ratios = [0.13, 0.16, 0.18, 0.22]
-
-min_obj_size = 10
-min_arc_points = 6
-
-R_min = 2
-R_max = 600
-
-min_bbox_size = 8
-max_residual = 10
-
-merge_center_dist = 35
-merge_radius_diff = 35
-
-GT_DRAW_RADIUS_MIN = 8
-
-# =========================
-# 左上大圓參數
-# =========================
-LEFT_TOP_X_LIMIT = 65
-LEFT_TOP_Y_LIMIT = 170
-
-LEFT_TOP_FIRST_X = 7
-LEFT_TOP_FIRST_Y = 105
-
-LEFT_TOP_R_MIN = 60
-LEFT_TOP_R_MAX = 360
-
-LEFT_TOP_MAX_RESIDUAL = 70
-LEFT_TOP_RING_TOL = 25.0
-
-# =========================
-# 中大型 crater 參數
-# =========================
-large_threshold_ratios = [0.13, 0.16, 0.18, 0.22]
-
-large_min_obj_size = 10
-large_min_arc_points = 6
-large_min_bbox_size = 8
-large_R_min = 10
-large_R_max = 600
-large_max_residual = 10
-
-
-# =========================
-# 小型 crater 參數
-# =========================
-small_threshold_ratios = [0.08, 0.10, 0.12, 0.13]
-
-small_min_obj_size = 3
-small_min_arc_points = 3
-small_min_bbox_size = 3
-small_R_min = 3
-small_R_max = 18
-small_max_residual = 3.5
-
-
-# =========================
-# 工具：圓擬合
-# =========================
-def fit_circle_least_squares(points):
-    if len(points) < 3:
-        return None
-
-    x = points[:, 0]
-    y = points[:, 1]
-
-    A = np.column_stack([x, y, np.ones_like(x)])
-    B = -(x**2 + y**2)
-
-    try:
-        D, E, F = np.linalg.lstsq(A, B, rcond=None)[0]
-    except np.linalg.LinAlgError:
-        return None
-
-    xc = -D / 2
-    yc = -E / 2
-
-    r2 = xc**2 + yc**2 - F
-    if r2 <= 0:
-        return None
-
-    r = np.sqrt(r2)
-
-    distances = np.sqrt((x - xc) ** 2 + (y - yc) ** 2)
-    residual = np.mean(np.abs(distances - r))
-
-    return xc, yc, r, residual
-
-
-def arc_fitting_from_mask(
-    pred_bin,
-    min_arc_points_use,
-    min_bbox_size_use,
-    R_min_use,
-    R_max_use,
-    max_residual_use,
-    method_name="arc_fit"
-):
-    labeled = label(pred_bin)
-    regions = regionprops(labeled)
-
-    circles = []
-
-    for region in regions:
-        if region.area < min_arc_points_use:
-            continue
-
-        coords = region.coords
-
-        y = coords[:, 0]
-        x = coords[:, 1]
-
-        bbox_h = region.bbox[2] - region.bbox[0]
-        bbox_w = region.bbox[3] - region.bbox[1]
-
-        if max(bbox_h, bbox_w) < min_bbox_size_use:
-            continue
-
-        points = np.column_stack([x, y])
-
-        fit = fit_circle_least_squares(points)
-        if fit is None:
-            continue
-
-        xc, yc, r, residual = fit
-
-        if r < R_min_use or r > R_max_use:
-            continue
-
-        if xc < -200 or xc > 456 or yc < -200 or yc > 456:
-            continue
-
-        if residual > max_residual_use:
-            continue
-
-        circles.append({
-            "x_center": float(xc),
-            "y_center": float(yc),
-            "radius": float(r),
-            "diameter": float(r * 2),
-            "arc_area": int(region.area),
-            "residual": float(residual),
-            "method": method_name
-        })
-
-    return circles
-
-def detect_craters_by_params(
-    pred,
-    threshold_ratios_use,
-    min_obj_size_use,
-    min_arc_points_use,
-    min_bbox_size_use,
-    R_min_use,
-    R_max_use,
-    max_residual_use,
-    method_name
-):
-    all_circles = []
-    all_bins = []
-
-    for ratio in threshold_ratios_use:
-        threshold = ratio * pred.max()
-
-        temp_bin = pred > threshold
-        temp_bin = binary_closing(temp_bin, footprint=disk(2))
-        temp_bin = remove_small_objects(temp_bin, min_size=min_obj_size_use)
-
-        temp_circles = arc_fitting_from_mask(
-            temp_bin,
-            min_arc_points_use,
-            min_bbox_size_use,
-            R_min_use,
-            R_max_use,
-            max_residual_use,
-            method_name=method_name
-        )
-
-        for c in temp_circles:
-            c["threshold_ratio"] = ratio
-            c["threshold"] = float(threshold)
-
-        all_circles.extend(temp_circles)
-        all_bins.append(temp_bin)
-
-    if len(all_bins) > 0:
-        pred_bin = np.logical_or.reduce(all_bins)
-    else:
-        pred_bin = np.zeros_like(pred, dtype=bool)
-
-    return all_circles, pred_bin
-
-def merge_similar_circles(circles):
-    if circles is None or len(circles) == 0:
-        return []
-
-    circles = sorted(circles, key=lambda c: (-c["arc_area"], c["residual"]))
-    merged = []
-
-    for c in circles:
-        xc = c["x_center"]
-        yc = c["y_center"]
-        r = c["radius"]
-
-        duplicated = False
-
-        for m in merged:
-            d = np.sqrt((xc - m["x_center"]) ** 2 + (yc - m["y_center"]) ** 2)
-            dr = abs(r - m["radius"])
-
-            if d < merge_center_dist and dr < merge_radius_diff:
-                duplicated = True
-
-                if (c["arc_area"] > m["arc_area"]) and (c["residual"] < m["residual"] * 1.5):
-                    m.update(c)
-
-                break
-
-        if not duplicated:
-            merged.append(c)
-
-    return merged
-
-
-def remove_nested_small_false_circles(circles):
-    if circles is None or len(circles) == 0:
-        return []
-
-    keep = []
-
-    for i, c in enumerate(circles):
-        xc = c["x_center"]
-        yc = c["y_center"]
-        r = c["radius"]
-
-        is_false_nested = False
-
-        for j, big in enumerate(circles):
-            if i == j:
-                continue
-
-            bx = big["x_center"]
-            by = big["y_center"]
-            br = big["radius"]
-
-            if br < r * 3.0:
-                continue
-
-            d = np.sqrt((xc - bx) ** 2 + (yc - by) ** 2)
-
-            rim_dist = abs(d - br)
-
-            # 如果小圓靠近大圓 rim，就保留
-            if rim_dist < max(5, 0.5 * r):
-                continue
-
-            # 只有很深地落在大圓內部，而且非常小，才刪
-            if d < br * 0.45 and r < br * 0.20:
-                is_false_nested = True
-                break
-
-        if not is_false_nested:
-            keep.append(c)
-
-    return keep
-
-def add_left_top_boundary_big_circle(pred_bin, circles):
-    if circles is None:
-        circles = []
-
-    ys, xs = np.where(pred_bin)
-
-    sel1 = (
-        (xs < LEFT_TOP_X_LIMIT) &
-        (ys < LEFT_TOP_Y_LIMIT) &
-        ((xs < LEFT_TOP_FIRST_X) | (ys < LEFT_TOP_FIRST_Y))
-    )
-
-    xs1 = xs[sel1]
-    ys1 = ys[sel1]
-
-    if DEBUG_LEFT_TOP:
-        print("\n===== Left-top boundary debug =====")
-        print("coarse candidate points =", len(xs1))
-
-    if len(xs1) < 5:
-        return circles
-
-    points1 = np.column_stack([xs1, ys1])
-    fit1 = fit_circle_least_squares(points1)
-
-    if fit1 is None:
-        return circles
-
-    xc1, yc1, r1, residual1 = fit1
-
-    if DEBUG_LEFT_TOP:
-        print(f"coarse fit -> xc={xc1:.2f}, yc={yc1:.2f}, r={r1:.2f}, residual={residual1:.2f}")
-
-    if r1 < LEFT_TOP_R_MIN or r1 > LEFT_TOP_R_MAX:
-        return circles
-
-    dist_all = np.sqrt((xs - xc1) ** 2 + (ys - yc1) ** 2)
-
-    sel2 = (
-        (xs < LEFT_TOP_X_LIMIT) &
-        (ys < LEFT_TOP_Y_LIMIT) &
-        (np.abs(dist_all - r1) < LEFT_TOP_RING_TOL)
-    )
-
-    xs2 = xs[sel2]
-    ys2 = ys[sel2]
-
-    if len(xs2) >= 5:
-        points2 = np.column_stack([xs2, ys2])
-        fit2 = fit_circle_least_squares(points2)
-
-        if fit2 is not None:
-            xc, yc, r, residual = fit2
-        else:
-            xc, yc, r, residual = xc1, yc1, r1, residual1
-    else:
-        xc, yc, r, residual = xc1, yc1, r1, residual1
-
-    if DEBUG_LEFT_TOP:
-        print(f"refined fit -> xc={xc:.2f}, yc={yc:.2f}, r={r:.2f}, residual={residual:.2f}")
-
-    if r < LEFT_TOP_R_MIN or r > LEFT_TOP_R_MAX:
-        return circles
-
-    if xc > 90 or yc > 150:
-        return circles
-
-    if residual > LEFT_TOP_MAX_RESIDUAL:
-        return circles
-
-    for c in circles:
-        d = np.sqrt((xc - c["x_center"]) ** 2 + (yc - c["y_center"]) ** 2)
-        dr = abs(r - c["radius"])
-
-        if d < 20 and dr < 20:
-            return circles
-
-    new_circle = {
-        "x_center": float(xc),
-        "y_center": float(yc),
-        "radius": float(r),
-        "diameter": float(r * 2),
-        "arc_area": int(len(xs2)) if len(xs2) >= 5 else int(len(xs1)),
-        "residual": float(residual),
-        "method": "left_top_boundary_arc",
-        "threshold_ratio": None,
-        "threshold": None
-    }
-
-    circles.append(new_circle)
-    return circles
-
-
-# =========================
-# Crater-level evaluation
-# =========================
-def crater_level_eval(gt_df, idx, pred_circles):
-    possible_names = [
-        f"tile_{idx:04d}.png",
-        f"dev_image_{idx:05d}.png",
-        f"img_{idx:05d}.png"
-    ]
-
-    gt_sub = gt_df[gt_df["FileName"].isin(possible_names)].copy()
-
-    if GT_DIAMETER_MIN > 0:
-        gt_sub = gt_sub[gt_sub["Diameter (pix)"] >= GT_DIAMETER_MIN]
-
-    gt_circles = []
-
-    for _, row in gt_sub.iterrows():
-        gt_circles.append({
-            "x_center": float(row["x"]),
-            "y_center": float(row["y"]),
-            "radius": float(row["Diameter (pix)"]) / 2
-        })
-
-    pred_circles = pred_circles if pred_circles is not None else []
-
-    gt_matched = [False] * len(gt_circles)
-    pred_matched = [False] * len(pred_circles)
-
-    CENTER_TOL = 25
-    RADIUS_TOL_RATIO = 0.5
-
-    for pi, pred_c in enumerate(pred_circles):
-        px = pred_c["x_center"]
-        py = pred_c["y_center"]
-        pr = pred_c["radius"]
-
-        best_gi = None
-        best_dist = 1e9
-
-        for gi, gt_c in enumerate(gt_circles):
-            if gt_matched[gi]:
-                continue
-
-            gx = gt_c["x_center"]
-            gy = gt_c["y_center"]
-            gr = gt_c["radius"]
-
-            dist = np.sqrt((px - gx) ** 2 + (py - gy) ** 2)
-            radius_diff = abs(pr - gr)
-            radius_tol = max(8, gr * RADIUS_TOL_RATIO)
-
-            if dist < CENTER_TOL and radius_diff < radius_tol:
-                if dist < best_dist:
-                    best_dist = dist
-                    best_gi = gi
-
-        if best_gi is not None:
-            pred_matched[pi] = True
-            gt_matched[best_gi] = True
-
-    TP = sum(pred_matched)
-    FP = len(pred_circles) - TP
-    FN = len(gt_circles) - sum(gt_matched)
-
-    accuracy = TP / (TP + FP + FN + 1e-8)
-    precision = TP / (TP + FP + 1e-8)
-    recall = TP / (TP + FN + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-    return {
-        "GT_craters": len(gt_circles),
-        "Pred_craters": len(pred_circles),
-        "TP": TP,
-        "FP": FP,
-        "FN": FN,
-        "Accuracy": accuracy,
-        "Precision": precision,
-        "Recall": recall,
-        "F1_score": f1
-    }
-
-
-# =========================
-# 讀模型與 GT
-# =========================
+# =============================================================
+# template_match 參數（與論文一致的預設值）
+# =============================================================
+MINRAD          = 5    # 最小搜尋半徑（pixel）
+MAXRAD          = 40   # 最大搜尋半徑（pixel）
+TEMPLATE_THRESH = 0.5  # match_template 信心門檻
+TARGET_THRESH   = 0.1  # mask 二值化門檻
+LONGLAT_THRESH2 = 1.8  # 去重複：位置距離平方閾值
+RAD_THRESH      = 1.0  # 去重複：半徑差異閾值
+
+# =============================================================
+# 讀取模型
+# =============================================================
 print("Loading model...")
 model = tf.keras.models.load_model(model_path, compile=False)
 print("Model loaded.")
 
-gt_df = pd.read_csv(gt_csv_path)
-
-all_results = []
-summary_results = []
-
+# =============================================================
+# 主迴圈
+# =============================================================
 total_TP = 0
 total_FP = 0
 total_FN = 0
+total_N_csv    = 0
+total_N_detect = 0
 
+err_lo_all = []
+err_la_all = []
+err_r_all  = []
 
-# =========================
-# 跑前 NUM_IMAGES 張
-# =========================
-with h5py.File(dev_images_path, "r") as f:
-    total_imgs = f["input_images"].shape[0]
-    run_count = min(NUM_IMAGES, total_imgs)
+with h5py.File(dev_images_path,  "r") as f_img, \
+     h5py.File(dev_craters_path, "r") as f_crt:
+
+    total_imgs = f_img["input_images"].shape[0]
+    run_count  = min(NUM_IMAGES, total_imgs)
+
+    print(f"\nTotal images in file: {total_imgs}, running: {run_count}\n")
 
     for idx in range(run_count):
-        print(f"\n========== Processing image {idx + 1} / {run_count} ==========")
+        print(f"========== Image {idx+1}/{run_count} ==========")
 
-        img = f["input_images"][idx]
-        mask = f["target_masks"][idx]
+        # --------------------------------------------------
+        # 1. 讀圖 & 前處理（與論文 proc.preprocess 一致）
+        # --------------------------------------------------
+        img  = f_img["input_images"][idx].astype("float32")
+        mask = f_img["target_masks"][idx].astype("float32")
 
-        # =========================
-        # 前處理
-        # =========================
-        img_float = img.astype("float32")
-        img_norm = (img_float - img_float.min()) / (img_float.max() - img_float.min() + 1e-8)
+        # 正規化到 [0, 1]
+        img_min, img_max = img.min(), img.max()
+        img_norm = (img - img_min) / (img_max - img_min + 1e-8)
 
         x = img_norm.reshape(1, 256, 256, 1)
+
+        # --------------------------------------------------
+        # 2. 模型預測
+        # --------------------------------------------------
         pred_raw = model.predict(x, verbose=0)
 
         if pred_raw.ndim == 4:
@@ -518,272 +94,187 @@ with h5py.File(dev_images_path, "r") as f:
         elif pred_raw.ndim == 3:
             pred = pred_raw[0, :, :]
         else:
-            raise ValueError(f"模型輸出維度異常：{pred_raw.shape}")
+            raise ValueError(f"Unexpected model output shape: {pred_raw.shape}")
 
-        # =========================
-        # 強化影像，只拿來顯示
-        # =========================
+        # --------------------------------------------------
+        # 3. 讀取 GT crater 座標（從 dev_craters.hdf5）
+        # --------------------------------------------------
+        id_str = f"img_{idx:05d}"    # key 格式：img_00000, img_00001, ...
+
         try:
-            from skimage import exposure
-            img_enhanced = exposure.equalize_adapthist(img_norm, clip_limit=0.03)
-        except ModuleNotFoundError:
-            p2, p98 = np.percentile(img_norm, (2, 98))
-            img_enhanced = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
+            # 欄位順序：Diameter(km), Lat, Long, x, y, Diameter(pix)
+            block = f_crt[id_str]['block0_values'][...]
+            if block.ndim == 1:        # 只有一個坑，shape 是 (6,)
+                block = block.reshape(1, -1)
+            if block.shape[0] == 6 and block.shape[1] != 6:  # (6, N) 需轉置
+                block = block.T
+            x_pix   = block[:, 3]
+            y_pix   = block[:, 4]
+            r_pix   = block[:, 5] / 2.0   # Diameter → Radius
+            csv_coords = np.column_stack([x_pix, y_pix, r_pix])
+        except KeyError:
+            # 有些 image 沒有對應的 crater，視為空
+            csv_coords = np.empty((0, 3))
 
-        gt = mask > 0
+        # --------------------------------------------------
+        # 4. 後處理：用論文的 template_match_t2c
+        #    同時做偵測 + 與 GT 比較
+        # --------------------------------------------------
+        if len(csv_coords) > 0:
+            (N_match, N_csv, N_detect, maxr,
+             err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
+                pred.copy(),       # 會被就地修改，傳 copy
+                csv_coords.copy(),
+                minrad=MINRAD,
+                maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=TEMPLATE_THRESH,
+                target_thresh=TARGET_THRESH
+            )
+        else:
+            # 沒有 GT，只做偵測
+            templ_coords = tmt.template_match_t(
+                pred.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=TEMPLATE_THRESH,
+                target_thresh=TARGET_THRESH
+            )
+            N_match, N_csv, N_detect = 0, 0, len(templ_coords)
+            maxr = int(np.max(templ_coords.T[2])) if len(templ_coords) > 0 else 0
+            err_lo = err_la = err_r = frac_dupes = 0.0
 
-        # =========================
-        # 第一段：偵測中大型 crater
-        # =========================
-        large_circles, large_bin = detect_craters_by_params(
-            pred,
-            large_threshold_ratios,
-            large_min_obj_size,
-            large_min_arc_points,
-            large_min_bbox_size,
-            large_R_min,
-            large_R_max,
-            large_max_residual,
-            method_name="large_arc_fit"
+        # --------------------------------------------------
+        # 5. 統計
+        # --------------------------------------------------
+        TP = N_match
+        FP = N_detect - N_match
+        FN = N_csv - N_match
+
+        # 防止負值（極少數情況）
+        FP = max(FP, 0)
+        FN = max(FN, 0)
+
+        precision = TP / (TP + FP + 1e-8)
+        recall    = TP / (TP + FN + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
+
+        total_TP       += TP
+        total_FP       += FP
+        total_FN       += FN
+        total_N_csv    += N_csv
+        total_N_detect += N_detect
+
+        if N_match >= 1:
+            err_lo_all.append(err_lo)
+            err_la_all.append(err_la)
+            err_r_all.append(err_r)
+
+        print(f"  GT={N_csv}, Detected={N_detect}, TP={TP}, FP={FP}, FN={FN}")
+        print(f"  Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+
+        # --------------------------------------------------
+        # 6. 重新跑一次 template_match_t 取得預測座標（畫圖用）
+        # --------------------------------------------------
+        pred_for_plot = pred.copy()
+        pred_coords = tmt.template_match_t(
+            pred_for_plot,
+            minrad=MINRAD, maxrad=MAXRAD,
+            longlat_thresh2=LONGLAT_THRESH2,
+            rad_thresh=RAD_THRESH,
+            template_thresh=TEMPLATE_THRESH,
+            target_thresh=TARGET_THRESH
         )
 
-        # =========================
-        # 第二段：偵測小型 crater
-        # =========================
-        small_circles, small_bin = detect_craters_by_params(
-            pred,
-            small_threshold_ratios,
-            small_min_obj_size,
-            small_min_arc_points,
-            small_min_bbox_size,
-            small_R_min,
-            small_R_max,
-            small_max_residual,
-            method_name="small_arc_fit"
-        )
+        # --------------------------------------------------
+        # 7. 畫圖（2x2）
+        # --------------------------------------------------
+        # 強化顯示用
+        p2, p98 = np.percentile(img_norm, (2, 98))
+        img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
 
-        # 合併 binary mask，畫圖用
-        pred_bin = np.logical_or(large_bin, small_bin)
+        fig, ax = plt.subplots(2, 2, figsize=(10, 10))
 
-        # 合併候選圓
-        all_arc_circles = large_circles + small_circles
-
-        final_circles = merge_similar_circles(all_arc_circles)
-
-        # 左上大圓補抓
-        final_circles = add_left_top_boundary_big_circle(pred_bin, final_circles)
-
-        final_circles = merge_similar_circles(final_circles)
-
-        # 移除明顯假小圓
-        final_circles = remove_nested_small_false_circles(final_circles)
-
-        final_circles = merge_similar_circles(final_circles)
-
-        cx = np.array([c["x_center"] for c in final_circles])
-        cy = np.array([c["y_center"] for c in final_circles])
-        radii = np.array([c["radius"] for c in final_circles])
-
-        # =========================
-        # 記錄預測圓
-        # =========================
-        for i, c in enumerate(final_circles):
-            all_results.append({
-                "image_index": idx,
-                "FileName": f"dev_image_{idx:05d}.png",
-                "id": i + 1,
-                "x_center": c["x_center"],
-                "y_center": c["y_center"],
-                "radius": c["radius"],
-                "diameter": c["diameter"],
-                "arc_area": c.get("arc_area", None),
-                "residual": c.get("residual", None),
-                "method": c.get("method", None),
-                "threshold_ratio": c.get("threshold_ratio", None),
-                "threshold": c.get("threshold", None)
-            })
-
-        # =========================
-        # Crater-level evaluation
-        # =========================
-        eval_result = crater_level_eval(gt_df, idx, final_circles)
-
-        total_TP += eval_result["TP"]
-        total_FP += eval_result["FP"]
-        total_FN += eval_result["FN"]
-
-        summary_results.append({
-            "image_index": idx,
-            "FileName": f"dev_image_{idx:05d}.png",
-            **eval_result
-        })
-
-        print(f"GT craters   = {eval_result['GT_craters']}")
-        print(f"Pred craters = {eval_result['Pred_craters']}")
-        print(f"TP={eval_result['TP']}, FP={eval_result['FP']}, FN={eval_result['FN']}")
-        print(
-            f"Accuracy={eval_result['Accuracy']:.4f}, "
-            f"Precision={eval_result['Precision']:.4f}, "
-            f"Recall={eval_result['Recall']:.4f}, "
-            f"F1={eval_result['F1_score']:.4f}"
-        )
-
-        # =========================
-        # 取得這張圖要畫的 GT circles
-        # =========================
-        possible_names = [
-            f"tile_{idx:04d}.png",
-            f"dev_image_{idx:05d}.png",
-            f"img_{idx:05d}.png"
-        ]
-
-        gt_sub_draw = gt_df[gt_df["FileName"].isin(possible_names)].copy()
-        gt_sub_draw["radius"] = gt_sub_draw["Diameter (pix)"] / 2
-        gt_sub_draw = gt_sub_draw[gt_sub_draw["radius"] >= GT_DRAW_RADIUS_MIN]
-
-        # =========================
-        # 畫圖
-        # =========================
-        fig, ax = plt.subplots(2, 2, figsize=(8, 8))
-
-        # 1. 原圖
-        ax[0, 0].imshow(img_enhanced, cmap="gray")
-        ax[0, 0].set_title("image")
+        # (0,0) 原圖
+        ax[0, 0].imshow(img_disp, cmap="gray")
+        ax[0, 0].set_title("Input image")
         ax[0, 0].axis("off")
 
-        # 2. GT 綠圈，只畫半徑夠大的
-        ax[0, 1].imshow(img_enhanced, cmap="gray")
-
-        for _, row in gt_sub_draw.iterrows():
-            circ = Circle(
-                (row["x"], row["y"]),
-                row["radius"],
-                fill=False,
-                edgecolor="lime",
-                linewidth=1.5
-            )
-            ax[0, 1].add_patch(circ)
-
-        ax[0, 1].set_title("GT")
+        # (0,1) 模型輸出 mask
+        ax[0, 1].imshow(pred, cmap="hot", vmin=0, vmax=1)
+        ax[0, 1].set_title("Model output (mask)")
         ax[0, 1].axis("off")
 
-        # 3. Pred 紅圈
-        ax[1, 0].imshow(img_enhanced, cmap="gray")
-
-        for i in range(len(radii)):
-            circ = Circle(
-                (cx[i], cy[i]),
-                radii[i],
-                fill=False,
-                edgecolor="red",
-                linewidth=2
-            )
+        # (1,0) GT（綠色圓圈）
+        ax[1, 0].imshow(img_disp, cmap="gray")
+        for (gx, gy, gr) in csv_coords:
+            circ = Circle((gx, gy), gr,
+                           fill=False, edgecolor="lime", linewidth=1.5)
             ax[1, 0].add_patch(circ)
-            ax[1, 0].text(
-                cx[i],
-                cy[i],
-                str(i + 1),
-                color="yellow",
-                fontsize=10,
-                ha="center",
-                va="center"
-            )
-
-        ax[1, 0].set_title(f"Arc fitting: {len(radii)} craters")
+        ax[1, 0].set_title(f"Ground Truth ({len(csv_coords)} craters)")
         ax[1, 0].axis("off")
 
-        # 4. GT + Pred
-        ax[1, 1].imshow(img_enhanced, cmap="gray")
-
-        # 畫 GT 綠圈
-        for _, row in gt_sub_draw.iterrows():
-            circ = Circle(
-                (row["x"], row["y"]),
-                row["radius"],
-                fill=False,
-                edgecolor="lime",
-                linewidth=1.5
-            )
+        # (1,1) GT（綠）+ 預測（紅）
+        ax[1, 1].imshow(img_disp, cmap="gray")
+        for (gx, gy, gr) in csv_coords:
+            circ = Circle((gx, gy), gr,
+                           fill=False, edgecolor="lime", linewidth=1.5)
             ax[1, 1].add_patch(circ)
-
-        # 畫 Pred 紅圈
-        for i in range(len(radii)):
-            circ = Circle(
-                (cx[i], cy[i]),
-                radii[i],
-                fill=False,
-                edgecolor="red",
-                linewidth=2
-            )
+        for (px, py, pr) in pred_coords:
+            circ = Circle((px, py), pr,
+                           fill=False, edgecolor="red", linewidth=1.5)
             ax[1, 1].add_patch(circ)
-            ax[1, 1].text(
-                cx[i],
-                cy[i],
-                str(i + 1),
-                color="yellow",
-                fontsize=10,
-                ha="center",
-                va="center"
-            )
-
-        ax[1, 1].set_title("GT(green) + ArcFit(red)")
+        ax[1, 1].set_title(
+            f"GT(green) + Pred(red)\n"
+            f"P={precision:.2f} R={recall:.2f} F1={f1:.2f}"
+        )
         ax[1, 1].axis("off")
 
+        plt.suptitle(f"Image {idx:05d}", fontsize=13)
         plt.tight_layout()
 
-        fig_path = os.path.join(output_dir, f"arcfit_boundary_fixed_result_plot_{idx:05d}.png")
-        fig.savefig(fig_path, dpi=120, bbox_inches="tight")
+        fig_path = os.path.join(output_dir, f"result_{idx:05d}.png")
+        fig.savefig(fig_path, dpi=100, bbox_inches="tight")
         plt.close(fig)
         gc.collect()
 
-# =========================
-# 存 CSV
-# =========================
-all_results_df = pd.DataFrame(all_results)
-summary_df = pd.DataFrame(summary_results)
-
-all_csv_path = os.path.join(output_dir, "arcfit_all_craters_first100.csv")
-summary_csv_path = os.path.join(output_dir, "arcfit_crater_level_summary_first100.csv")
-
-all_results_df.to_csv(all_csv_path, index=False, encoding="utf-8-sig")
-summary_df.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
-
-
-# =========================
-# 總結果
-# =========================
-total_accuracy = total_TP / (total_TP + total_FP + total_FN + 1e-8)
+# =============================================================
+# 總結
+# =============================================================
 total_precision = total_TP / (total_TP + total_FP + 1e-8)
-total_recall = total_TP / (total_TP + total_FN + 1e-8)
-total_f1 = 2 * total_precision * total_recall / (total_precision + total_recall + 1e-8)
+total_recall    = total_TP / (total_TP + total_FN + 1e-8)
+total_f1        = (2 * total_precision * total_recall
+                   / (total_precision + total_recall + 1e-8))
 
-total_df = pd.DataFrame([{
-    "Total_TP": total_TP,
-    "Total_FP": total_FP,
-    "Total_FN": total_FN,
-    "Accuracy": total_accuracy,
-    "Precision": total_precision,
-    "Recall": total_recall,
-    "F1_score": total_f1
-}])
+mean_err_lo = np.mean(err_lo_all) if err_lo_all else 0.0
+mean_err_la = np.mean(err_la_all) if err_la_all else 0.0
+mean_err_r  = np.mean(err_r_all)  if err_r_all  else 0.0
 
-total_csv_path = os.path.join(output_dir, "arcfit_total_precision_recall_f1_first100.csv")
-total_df.to_csv(total_csv_path, index=False, encoding="utf-8-sig")
+print("\n" + "="*55)
+print(f"  前 {NUM_IMAGES} 張總體評估結果")
+print("="*55)
+print(f"  Total GT craters    : {total_N_csv}")
+print(f"  Total detected      : {total_N_detect}")
+print(f"  Total TP            : {total_TP}")
+print(f"  Total FP            : {total_FP}")
+print(f"  Total FN            : {total_FN}")
+print("-"*55)
+print(f"  Precision           : {total_precision:.4f}")
+print(f"  Recall              : {total_recall:.4f}")
+print(f"  F1-score            : {total_f1:.4f}")
+print("-"*55)
+print(f"  Mean longitude err  : {mean_err_lo*100:.1f}%")
+print(f"  Mean latitude err   : {mean_err_la*100:.1f}%")
+print(f"  Mean radius err     : {mean_err_r*100:.1f}%")
+print("="*55)
+print(f"\n  圖片輸出資料夾：{output_dir}")
 
-print("\n==============================")
-print(f"前 {NUM_IMAGES} 張處理完成！")
-print(f"所有 crater 結果 CSV：{all_csv_path}")
-print(f"每張 crater-level summary CSV：{summary_csv_path}")
-print(f"總體 Precision/Recall/F1 CSV：{total_csv_path}")
-print(f"圖片輸出資料夾：{output_dir}")
-print("==============================")
-
-print(f"\n========== 前 {NUM_IMAGES} 張總體 Crater-level Evaluation ==========")
-print(f"Total TP = {total_TP}")
-print(f"Total FP = {total_FP}")
-print(f"Total FN = {total_FN}")
-print(f"Accuracy  = {total_accuracy:.4f}")
-print(f"Precision = {total_precision:.4f}")
-print(f"Recall    = {total_recall:.4f}")
-print(f"F1-score  = {total_f1:.4f}")
-print("=========================================================\n")
+# =============================================================
+# 與論文數字對比提示
+# =============================================================
+print("\n  [論文 Post-Processed Test 數字參考]")
+print("  Recall    : 92%")
+print("  Precision : 56%")
+print("  (dev set 與 test set 會有些許差異)")
