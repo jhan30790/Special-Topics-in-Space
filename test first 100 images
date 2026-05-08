@@ -9,7 +9,7 @@ import gc
 from matplotlib.patches import Circle
 
 # =============================================================
-# 把 DeepMoon repo 加入 Python path（請改成你的實際路徑）
+# DeepMoon repo 路徑
 # =============================================================
 DEEPMOON_DIR = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master"
 sys.path.insert(0, DEEPMOON_DIR)
@@ -32,61 +32,45 @@ os.makedirs(output_dir, exist_ok=True)
 NUM_IMAGES = 100
 
 # =============================================================
-# template_match 參數（與論文一致的預設值）
+# 固定參數
 # =============================================================
-MINRAD          = 5    # 最小搜尋半徑（pixel）
-MAXRAD          = 40   # 最大搜尋半徑（pixel）
-TEMPLATE_THRESH = 0.5  # match_template 信心門檻
-TARGET_THRESH   = 0.1  # mask 二值化門檻
-LONGLAT_THRESH2 = 1.8  # 去重複：位置距離平方閾值
-RAD_THRESH      = 1.0  # 去重複：半徑差異閾值
+MINRAD          = 5
+MAXRAD          = 40
+TARGET_THRESH   = 0.1
+LONGLAT_THRESH2 = 1.8
+RAD_THRESH      = 1.0
+
+# 掃描這些 template_thresh
+TEMPLATE_THRESH_LIST = [0.33, 0.35, 0.37, 0.38, 0.39, 0.40, 0.42, 0.45]
 
 # =============================================================
-# 讀取模型
+# 讀取模型（只需要讀一次）
 # =============================================================
 print("Loading model...")
 model = tf.keras.models.load_model(model_path, compile=False)
-print("Model loaded.")
+print("Model loaded.\n")
 
 # =============================================================
-# 主迴圈
+# 讀取所有圖片的預測結果（只跑一次模型）
 # =============================================================
-total_TP = 0
-total_FP = 0
-total_FN = 0
-total_N_csv    = 0
-total_N_detect = 0
+all_preds      = []
+all_csv_coords = []
+all_img_disp   = []
 
-err_lo_all = []
-err_la_all = []
-err_r_all  = []
-
+print("Running model predictions...")
 with h5py.File(dev_images_path,  "r") as f_img, \
      h5py.File(dev_craters_path, "r") as f_crt:
 
     total_imgs = f_img["input_images"].shape[0]
     run_count  = min(NUM_IMAGES, total_imgs)
 
-    print(f"\nTotal images in file: {total_imgs}, running: {run_count}\n")
-
     for idx in range(run_count):
-        print(f"========== Image {idx+1}/{run_count} ==========")
-
-        # --------------------------------------------------
-        # 1. 讀圖 & 前處理（與論文 proc.preprocess 一致）
-        # --------------------------------------------------
-        img  = f_img["input_images"][idx].astype("float32")
-        mask = f_img["target_masks"][idx].astype("float32")
-
-        # 正規化到 [0, 1]
+        # 讀圖 & 前處理
+        img = f_img["input_images"][idx].astype("float32")
         img_min, img_max = img.min(), img.max()
         img_norm = (img - img_min) / (img_max - img_min + 1e-8)
 
         x = img_norm.reshape(1, 256, 256, 1)
-
-        # --------------------------------------------------
-        # 2. 模型預測
-        # --------------------------------------------------
         pred_raw = model.predict(x, verbose=0)
 
         if pred_raw.ndim == 4:
@@ -94,187 +78,193 @@ with h5py.File(dev_images_path,  "r") as f_img, \
         elif pred_raw.ndim == 3:
             pred = pred_raw[0, :, :]
         else:
-            raise ValueError(f"Unexpected model output shape: {pred_raw.shape}")
+            raise ValueError(f"Unexpected shape: {pred_raw.shape}")
 
-        # --------------------------------------------------
-        # 3. 讀取 GT crater 座標（從 dev_craters.hdf5）
-        # --------------------------------------------------
-        id_str = f"img_{idx:05d}"    # key 格式：img_00000, img_00001, ...
-
+        # 讀 GT
+        id_str = f"img_{idx:05d}"
         try:
-            # 欄位順序：Diameter(km), Lat, Long, x, y, Diameter(pix)
             block = f_crt[id_str]['block0_values'][...]
-            if block.ndim == 1:        # 只有一個坑，shape 是 (6,)
+            if block.ndim == 1:
                 block = block.reshape(1, -1)
-            if block.shape[0] == 6 and block.shape[1] != 6:  # (6, N) 需轉置
+            if block.shape[0] == 6 and block.shape[1] != 6:
                 block = block.T
-            x_pix   = block[:, 3]
-            y_pix   = block[:, 4]
-            r_pix   = block[:, 5] / 2.0   # Diameter → Radius
-            csv_coords = np.column_stack([x_pix, y_pix, r_pix])
+            if block.shape[1] < 6:
+                csv_coords = np.empty((0, 3))
+            else:
+                x_pix = block[:, 3]
+                y_pix = block[:, 4]
+                r_pix = block[:, 5] / 2.0
+                csv_coords = np.column_stack([x_pix, y_pix, r_pix])
         except KeyError:
-            # 有些 image 沒有對應的 crater，視為空
             csv_coords = np.empty((0, 3))
 
-        # --------------------------------------------------
-        # 4. 後處理：用論文的 template_match_t2c
-        #    同時做偵測 + 與 GT 比較
-        # --------------------------------------------------
+        # 顯示用圖
+        p2, p98 = np.percentile(img_norm, (2, 98))
+        img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+        all_preds.append(pred)
+        all_csv_coords.append(csv_coords)
+        all_img_disp.append(img_disp)
+
+        if (idx + 1) % 10 == 0:
+            print(f"  Predicted {idx+1}/{run_count}...")
+
+print(f"Done. {run_count} images predicted.\n")
+
+# =============================================================
+# 對每個 threshold 跑評估
+# =============================================================
+sweep_results = []
+
+for thresh in TEMPLATE_THRESH_LIST:
+    print(f"{'='*55}")
+    print(f"  template_thresh = {thresh}")
+    print(f"{'='*55}")
+
+    thresh_dir = os.path.join(output_dir, f"thresh_{thresh}")
+    os.makedirs(thresh_dir, exist_ok=True)
+
+    total_TP = 0
+    total_FP = 0
+    total_FN = 0
+    err_lo_all = []
+    err_la_all = []
+    err_r_all  = []
+
+    for idx in range(run_count):
+        pred       = all_preds[idx]
+        csv_coords = all_csv_coords[idx]
+        img_disp   = all_img_disp[idx]
+
+        # 評估
         if len(csv_coords) > 0:
             (N_match, N_csv, N_detect, maxr,
              err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
-                pred.copy(),       # 會被就地修改，傳 copy
+                pred.copy(),
                 csv_coords.copy(),
-                minrad=MINRAD,
-                maxrad=MAXRAD,
+                minrad=MINRAD, maxrad=MAXRAD,
                 longlat_thresh2=LONGLAT_THRESH2,
                 rad_thresh=RAD_THRESH,
-                template_thresh=TEMPLATE_THRESH,
+                template_thresh=thresh,
                 target_thresh=TARGET_THRESH
             )
         else:
-            # 沒有 GT，只做偵測
             templ_coords = tmt.template_match_t(
                 pred.copy(),
                 minrad=MINRAD, maxrad=MAXRAD,
                 longlat_thresh2=LONGLAT_THRESH2,
                 rad_thresh=RAD_THRESH,
-                template_thresh=TEMPLATE_THRESH,
+                template_thresh=thresh,
                 target_thresh=TARGET_THRESH
             )
             N_match, N_csv, N_detect = 0, 0, len(templ_coords)
-            maxr = int(np.max(templ_coords.T[2])) if len(templ_coords) > 0 else 0
-            err_lo = err_la = err_r = frac_dupes = 0.0
+            err_lo = err_la = err_r = 0.0
 
-        # --------------------------------------------------
-        # 5. 統計
-        # --------------------------------------------------
         TP = N_match
-        FP = N_detect - N_match
-        FN = N_csv - N_match
+        FP = max(N_detect - N_match, 0)
+        FN = max(N_csv - N_match, 0)
 
-        # 防止負值（極少數情況）
-        FP = max(FP, 0)
-        FN = max(FN, 0)
-
-        precision = TP / (TP + FP + 1e-8)
-        recall    = TP / (TP + FN + 1e-8)
-        f1        = 2 * precision * recall / (precision + recall + 1e-8)
-
-        total_TP       += TP
-        total_FP       += FP
-        total_FN       += FN
-        total_N_csv    += N_csv
-        total_N_detect += N_detect
+        total_TP += TP
+        total_FP += FP
+        total_FN += FN
 
         if N_match >= 1:
             err_lo_all.append(err_lo)
             err_la_all.append(err_la)
             err_r_all.append(err_r)
 
-        print(f"  GT={N_csv}, Detected={N_detect}, TP={TP}, FP={FP}, FN={FN}")
-        print(f"  Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+        precision = TP / (TP + FP + 1e-8)
+        recall    = TP / (TP + FN + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
 
-        # --------------------------------------------------
-        # 6. 重新跑一次 template_match_t 取得預測座標（畫圖用）
-        # --------------------------------------------------
-        pred_for_plot = pred.copy()
-        pred_coords = tmt.template_match_t(
-            pred_for_plot,
-            minrad=MINRAD, maxrad=MAXRAD,
-            longlat_thresh2=LONGLAT_THRESH2,
-            rad_thresh=RAD_THRESH,
-            template_thresh=TEMPLATE_THRESH,
-            target_thresh=TARGET_THRESH
-        )
+        # 畫圖（只畫前 20 張省時間）
+        if idx < 20:
+            pred_coords = tmt.template_match_t(
+                pred.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=thresh,
+                target_thresh=TARGET_THRESH
+            )
 
-        # --------------------------------------------------
-        # 7. 畫圖（2x2）
-        # --------------------------------------------------
-        # 強化顯示用
-        p2, p98 = np.percentile(img_norm, (2, 98))
-        img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
+            fig, ax = plt.subplots(1, 2, figsize=(12, 6))
 
-        fig, ax = plt.subplots(2, 2, figsize=(10, 10))
+            ax[0].imshow(img_disp, cmap="gray")
+            for (gx, gy, gr) in csv_coords:
+                ax[0].add_patch(Circle((gx, gy), gr,
+                    fill=False, edgecolor="lime", linewidth=1.5))
+            ax[0].set_title(f"GT ({len(csv_coords)} craters)")
+            ax[0].axis("off")
 
-        # (0,0) 原圖
-        ax[0, 0].imshow(img_disp, cmap="gray")
-        ax[0, 0].set_title("Input image")
-        ax[0, 0].axis("off")
+            ax[1].imshow(img_disp, cmap="gray")
+            for (gx, gy, gr) in csv_coords:
+                ax[1].add_patch(Circle((gx, gy), gr,
+                    fill=False, edgecolor="lime", linewidth=1.5))
+            for (px, py, pr) in pred_coords:
+                ax[1].add_patch(Circle((px, py), pr,
+                    fill=False, edgecolor="red", linewidth=1.5))
+            ax[1].set_title(
+                f"GT(green) + Pred(red)\n"
+                f"P={precision:.2f} R={recall:.2f} F1={f1:.2f}"
+            )
+            ax[1].axis("off")
 
-        # (0,1) 模型輸出 mask
-        ax[0, 1].imshow(pred, cmap="hot", vmin=0, vmax=1)
-        ax[0, 1].set_title("Model output (mask)")
-        ax[0, 1].axis("off")
+            plt.suptitle(f"Image {idx:05d} | thresh={thresh}", fontsize=12)
+            plt.tight_layout()
+            fig.savefig(os.path.join(thresh_dir, f"result_{idx:05d}.png"),
+                        dpi=100, bbox_inches="tight")
+            plt.close(fig)
+            gc.collect()
 
-        # (1,0) GT（綠色圓圈）
-        ax[1, 0].imshow(img_disp, cmap="gray")
-        for (gx, gy, gr) in csv_coords:
-            circ = Circle((gx, gy), gr,
-                           fill=False, edgecolor="lime", linewidth=1.5)
-            ax[1, 0].add_patch(circ)
-        ax[1, 0].set_title(f"Ground Truth ({len(csv_coords)} craters)")
-        ax[1, 0].axis("off")
+    # 總結這個 threshold
+    total_precision = total_TP / (total_TP + total_FP + 1e-8)
+    total_recall    = total_TP / (total_TP + total_FN + 1e-8)
+    total_f1        = (2 * total_precision * total_recall
+                       / (total_precision + total_recall + 1e-8))
+    mean_err_lo = np.mean(err_lo_all) if err_lo_all else 0.0
+    mean_err_la = np.mean(err_la_all) if err_la_all else 0.0
+    mean_err_r  = np.mean(err_r_all)  if err_r_all  else 0.0
 
-        # (1,1) GT（綠）+ 預測（紅）
-        ax[1, 1].imshow(img_disp, cmap="gray")
-        for (gx, gy, gr) in csv_coords:
-            circ = Circle((gx, gy), gr,
-                           fill=False, edgecolor="lime", linewidth=1.5)
-            ax[1, 1].add_patch(circ)
-        for (px, py, pr) in pred_coords:
-            circ = Circle((px, py), pr,
-                           fill=False, edgecolor="red", linewidth=1.5)
-            ax[1, 1].add_patch(circ)
-        ax[1, 1].set_title(
-            f"GT(green) + Pred(red)\n"
-            f"P={precision:.2f} R={recall:.2f} F1={f1:.2f}"
-        )
-        ax[1, 1].axis("off")
+    print(f"  TP={total_TP}, FP={total_FP}, FN={total_FN}")
+    print(f"  Precision : {total_precision:.4f}")
+    print(f"  Recall    : {total_recall:.4f}")
+    print(f"  F1-score  : {total_f1:.4f}")
+    print(f"  Long err  : {mean_err_lo*100:.1f}%")
+    print(f"  Lat err   : {mean_err_la*100:.1f}%")
+    print(f"  Rad err   : {mean_err_r*100:.1f}%\n")
 
-        plt.suptitle(f"Image {idx:05d}", fontsize=13)
-        plt.tight_layout()
-
-        fig_path = os.path.join(output_dir, f"result_{idx:05d}.png")
-        fig.savefig(fig_path, dpi=100, bbox_inches="tight")
-        plt.close(fig)
-        gc.collect()
-
-# =============================================================
-# 總結
-# =============================================================
-total_precision = total_TP / (total_TP + total_FP + 1e-8)
-total_recall    = total_TP / (total_TP + total_FN + 1e-8)
-total_f1        = (2 * total_precision * total_recall
-                   / (total_precision + total_recall + 1e-8))
-
-mean_err_lo = np.mean(err_lo_all) if err_lo_all else 0.0
-mean_err_la = np.mean(err_la_all) if err_la_all else 0.0
-mean_err_r  = np.mean(err_r_all)  if err_r_all  else 0.0
-
-print("\n" + "="*55)
-print(f"  前 {NUM_IMAGES} 張總體評估結果")
-print("="*55)
-print(f"  Total GT craters    : {total_N_csv}")
-print(f"  Total detected      : {total_N_detect}")
-print(f"  Total TP            : {total_TP}")
-print(f"  Total FP            : {total_FP}")
-print(f"  Total FN            : {total_FN}")
-print("-"*55)
-print(f"  Precision           : {total_precision:.4f}")
-print(f"  Recall              : {total_recall:.4f}")
-print(f"  F1-score            : {total_f1:.4f}")
-print("-"*55)
-print(f"  Mean longitude err  : {mean_err_lo*100:.1f}%")
-print(f"  Mean latitude err   : {mean_err_la*100:.1f}%")
-print(f"  Mean radius err     : {mean_err_r*100:.1f}%")
-print("="*55)
-print(f"\n  圖片輸出資料夾：{output_dir}")
+    sweep_results.append({
+        "template_thresh": thresh,
+        "Precision": total_precision,
+        "Recall":    total_recall,
+        "F1":        total_f1,
+        "Long_err":  mean_err_lo * 100,
+        "Lat_err":   mean_err_la * 100,
+        "Rad_err":   mean_err_r  * 100,
+    })
 
 # =============================================================
-# 與論文數字對比提示
+# 最終比較表
 # =============================================================
-print("\n  [論文 Post-Processed Test 數字參考]")
-print("  Recall    : 92%")
-print("  Precision : 56%")
-print("  (dev set 與 test set 會有些許差異)")
+print("\n" + "="*65)
+print("  Threshold Sweep 結果比較")
+print("="*65)
+print(f"  {'Thresh':>8} | {'Precision':>10} | {'Recall':>8} | {'F1':>8}")
+print("-"*65)
+best = max(sweep_results, key=lambda x: x["F1"])
+for r in sweep_results:
+    marker = " <- best F1" if r["template_thresh"] == best["template_thresh"] else ""
+    print(f"  {r['template_thresh']:>8} | "
+          f"{r['Precision']:>10.4f} | "
+          f"{r['Recall']:>8.4f} | "
+          f"{r['F1']:>8.4f}{marker}")
+print("="*65)
+print(f"\n  最佳 threshold = {best['template_thresh']}")
+print(f"  Best F1        = {best['F1']:.4f}")
+print(f"  Precision      = {best['Precision']:.4f}")
+print(f"  Recall         = {best['Recall']:.4f}")
+
+print("\n  [論文 Post-Processed Test 參考]")
+print("  Recall=92%, Precision=56%")
+print(f"\n  圖片輸出：{output_dir}")
