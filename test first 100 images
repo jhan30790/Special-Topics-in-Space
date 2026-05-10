@@ -19,20 +19,15 @@ import utils.template_match_target as tmt
 # =============================================================
 # 路徑設定
 # =============================================================
-dev_images_path  = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_images.hdf5"
-dev_craters_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_craters.hdf5"
-model_path       = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
+model_path        = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
+mars_images_path  = r"C:\Users\jhan3\OneDrive\桌面\大二專題\deepmars-master\tests\ran_images_175000.hdf5"
+mars_craters_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\deepmars-master\tests\ran_craters_175000.hdf5"
 
-output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_deepmoon_eval"
+output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_mars_zeroshot"
 os.makedirs(output_dir, exist_ok=True)
 
 # =============================================================
-# 執行張數
-# =============================================================
-NUM_IMAGES = 100
-
-# =============================================================
-# 固定參數
+# 固定參數（跟月球版完全一樣）
 # =============================================================
 MINRAD          = 5
 MAXRAD          = 40
@@ -40,33 +35,37 @@ TARGET_THRESH   = 0.1
 LONGLAT_THRESH2 = 1.8
 RAD_THRESH      = 1.0
 
-# 掃描這些 template_thresh
-TEMPLATE_THRESH_LIST = [0.33, 0.35, 0.37, 0.38, 0.39, 0.40, 0.42, 0.45]
+# 掃描這些 threshold（從低開始，因為 zero-shot 信心值會偏低）
+TEMPLATE_THRESH_LIST = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
 
 # =============================================================
-# 讀取模型（只需要讀一次）
+# 讀取模型
 # =============================================================
 print("Loading model...")
 model = tf.keras.models.load_model(model_path, compile=False)
 print("Model loaded.\n")
 
 # =============================================================
-# 讀取所有圖片的預測結果（只跑一次模型）
+# 讀取火星圖片並跑推論
 # =============================================================
 all_preds      = []
 all_csv_coords = []
 all_img_disp   = []
+img_ids        = []
 
-print("Running model predictions...")
-with h5py.File(dev_images_path,  "r") as f_img, \
-     h5py.File(dev_craters_path, "r") as f_crt:
+print("Running model predictions on Mars data...")
+with h5py.File(mars_images_path,  "r") as f_img, \
+     h5py.File(mars_craters_path, "r") as f_crt:
 
-    total_imgs = f_img["input_images"].shape[0]
-    run_count  = min(NUM_IMAGES, total_imgs)
+    images = f_img["input_images"][:]
+    sorted_ids = sorted(f_crt.keys())
 
-    for idx in range(run_count):
-        # 讀圖 & 前處理
-        img = f_img["input_images"][idx].astype("float32")
+    for i, img_id in enumerate(sorted_ids):
+        if i >= len(images):
+            break
+
+        # 前處理（跟月球版一樣）
+        img = images[i].astype("float32")
         img_min, img_max = img.min(), img.max()
         img_norm = (img - img_min) / (img_max - img_min + 1e-8)
 
@@ -81,21 +80,15 @@ with h5py.File(dev_images_path,  "r") as f_img, \
             raise ValueError(f"Unexpected shape: {pred_raw.shape}")
 
         # 讀 GT
-        id_str = f"img_{idx:05d}"
         try:
-            block = f_crt[id_str]['block0_values'][...]
-            if block.ndim == 1:
-                block = block.reshape(1, -1)
-            if block.shape[0] == 6 and block.shape[1] != 6:
-                block = block.T
-            if block.shape[1] < 6:
-                csv_coords = np.empty((0, 3))
-            else:
-                x_pix = block[:, 3]
-                y_pix = block[:, 4]
-                r_pix = block[:, 5] / 2.0
-                csv_coords = np.column_stack([x_pix, y_pix, r_pix])
-        except KeyError:
+            cols  = [x.decode() for x in f_crt[img_id]['axis0'][:]]
+            vals  = f_crt[img_id]['block0_values'][:]
+            df    = dict(zip(cols, vals.T))
+            x_pix = df['x']
+            y_pix = df['y']
+            r_pix = df['Diameter (pix)'] / 2.0
+            csv_coords = np.column_stack([x_pix, y_pix, r_pix])
+        except Exception:
             csv_coords = np.empty((0, 3))
 
         # 顯示用圖
@@ -105,11 +98,11 @@ with h5py.File(dev_images_path,  "r") as f_img, \
         all_preds.append(pred)
         all_csv_coords.append(csv_coords)
         all_img_disp.append(img_disp)
+        img_ids.append(img_id)
 
-        if (idx + 1) % 10 == 0:
-            print(f"  Predicted {idx+1}/{run_count}...")
+        print(f"  [{img_id}] GT craters: {len(csv_coords)}")
 
-print(f"Done. {run_count} images predicted.\n")
+print(f"\nDone. {len(all_preds)} images predicted.\n")
 
 # =============================================================
 # 對每個 threshold 跑評估
@@ -131,12 +124,11 @@ for thresh in TEMPLATE_THRESH_LIST:
     err_la_all = []
     err_r_all  = []
 
-    for idx in range(run_count):
+    for idx, img_id in enumerate(img_ids):
         pred       = all_preds[idx]
         csv_coords = all_csv_coords[idx]
         img_disp   = all_img_disp[idx]
 
-        # 評估
         if len(csv_coords) > 0:
             (N_match, N_csv, N_detect, maxr,
              err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
@@ -177,45 +169,44 @@ for thresh in TEMPLATE_THRESH_LIST:
         recall    = TP / (TP + FN + 1e-8)
         f1        = 2 * precision * recall / (precision + recall + 1e-8)
 
-        # 畫圖（只畫前 20 張省時間）
-        if idx < 20:
-            pred_coords = tmt.template_match_t(
-                pred.copy(),
-                minrad=MINRAD, maxrad=MAXRAD,
-                longlat_thresh2=LONGLAT_THRESH2,
-                rad_thresh=RAD_THRESH,
-                template_thresh=thresh,
-                target_thresh=TARGET_THRESH
-            )
+        # 畫圖
+        pred_coords = tmt.template_match_t(
+            pred.copy(),
+            minrad=MINRAD, maxrad=MAXRAD,
+            longlat_thresh2=LONGLAT_THRESH2,
+            rad_thresh=RAD_THRESH,
+            template_thresh=thresh,
+            target_thresh=TARGET_THRESH
+        )
 
-            fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
 
-            ax[0].imshow(img_disp, cmap="gray")
-            for (gx, gy, gr) in csv_coords:
-                ax[0].add_patch(Circle((gx, gy), gr,
-                    fill=False, edgecolor="lime", linewidth=1.5))
-            ax[0].set_title(f"GT ({len(csv_coords)} craters)")
-            ax[0].axis("off")
+        ax[0].imshow(img_disp, cmap="gray")
+        for (gx, gy, gr) in csv_coords:
+            ax[0].add_patch(Circle((gx, gy), gr,
+                fill=False, edgecolor="lime", linewidth=1.5))
+        ax[0].set_title(f"GT ({len(csv_coords)} craters)")
+        ax[0].axis("off")
 
-            ax[1].imshow(img_disp, cmap="gray")
-            for (gx, gy, gr) in csv_coords:
-                ax[1].add_patch(Circle((gx, gy), gr,
-                    fill=False, edgecolor="lime", linewidth=1.5))
-            for (px, py, pr) in pred_coords:
-                ax[1].add_patch(Circle((px, py), pr,
-                    fill=False, edgecolor="red", linewidth=1.5))
-            ax[1].set_title(
-                f"GT(green) + Pred(red)\n"
-                f"P={precision:.2f} R={recall:.2f} F1={f1:.2f}"
-            )
-            ax[1].axis("off")
+        ax[1].imshow(img_disp, cmap="gray")
+        for (gx, gy, gr) in csv_coords:
+            ax[1].add_patch(Circle((gx, gy), gr,
+                fill=False, edgecolor="lime", linewidth=1.5))
+        for (px, py, pr) in pred_coords:
+            ax[1].add_patch(Circle((px, py), pr,
+                fill=False, edgecolor="red", linewidth=1.5))
+        ax[1].set_title(
+            f"GT(green) + Pred(red)\n"
+            f"P={precision:.2f} R={recall:.2f} F1={f1:.2f}"
+        )
+        ax[1].axis("off")
 
-            plt.suptitle(f"Image {idx:05d} | thresh={thresh}", fontsize=12)
-            plt.tight_layout()
-            fig.savefig(os.path.join(thresh_dir, f"result_{idx:05d}.png"),
-                        dpi=100, bbox_inches="tight")
-            plt.close(fig)
-            gc.collect()
+        plt.suptitle(f"[Mars] {img_id} | thresh={thresh}", fontsize=12)
+        plt.tight_layout()
+        fig.savefig(os.path.join(thresh_dir, f"result_{img_id}.png"),
+                    dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        gc.collect()
 
     # 總結這個 threshold
     total_precision = total_TP / (total_TP + total_FP + 1e-8)
@@ -239,16 +230,13 @@ for thresh in TEMPLATE_THRESH_LIST:
         "Precision": total_precision,
         "Recall":    total_recall,
         "F1":        total_f1,
-        "Long_err":  mean_err_lo * 100,
-        "Lat_err":   mean_err_la * 100,
-        "Rad_err":   mean_err_r  * 100,
     })
 
 # =============================================================
 # 最終比較表
 # =============================================================
 print("\n" + "="*65)
-print("  Threshold Sweep 結果比較")
+print("  火星 Zero-Shot Threshold Sweep 結果")
 print("="*65)
 print(f"  {'Thresh':>8} | {'Precision':>10} | {'Recall':>8} | {'F1':>8}")
 print("-"*65)
@@ -260,11 +248,9 @@ for r in sweep_results:
           f"{r['Recall']:>8.4f} | "
           f"{r['F1']:>8.4f}{marker}")
 print("="*65)
-print(f"\n  最佳 threshold = {best['template_thresh']}")
-print(f"  Best F1        = {best['F1']:.4f}")
-print(f"  Precision      = {best['Precision']:.4f}")
-print(f"  Recall         = {best['Recall']:.4f}")
 
-print("\n  [論文 Post-Processed Test 參考]")
-print("  Recall=92%, Precision=56%")
+print("\n  對比月球最佳結果（threshold=0.35）：")
+print(f"  月球 Precision: 0.7631  |  火星最佳: {best['Precision']:.4f}")
+print(f"  月球 Recall:    0.2361  |  火星最佳: {best['Recall']:.4f}")
+print(f"  月球 F1:        0.3606  |  火星最佳: {best['F1']:.4f}")
 print(f"\n  圖片輸出：{output_dir}")
