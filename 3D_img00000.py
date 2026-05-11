@@ -1,352 +1,367 @@
 import os
+import sys
 import h5py
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
+import tensorflow as tf
+import gc
 
 from matplotlib.patches import Circle
-from PIL import Image
 from scipy.ndimage import gaussian_filter
 from matplotlib.colors import LightSource
 
+# =============================================================
+# DeepMoon repo 路徑
+# =============================================================
+DEEPMOON_DIR = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master"
+sys.path.insert(0, DEEPMOON_DIR)
 
-# =========================
-# 路徑設定（自己改）
-# =========================
-h5_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_images.hdf5"
-gt_csv_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_craters_all.csv"
-pred_csv_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_img_100_2\arcfit_all_craters_first100.csv"
-enhanced_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\dev_images100_enhanced_png"
-output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\3d_dem_img"
+import utils.template_match_target as tmt
 
+# =============================================================
+# 路徑設定
+# =============================================================
+dev_images_path  = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_images.hdf5"
+dev_craters_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\dev_craters.hdf5"
+model_path       = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
+
+output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_deepmoon_eval"
 os.makedirs(output_dir, exist_ok=True)
 
-
-# =========================
-# 基本設定
-# =========================
-h5_dataset_key = "input_images"
+# =============================================================
+# 執行張數
+# =============================================================
 NUM_IMAGES = 100
 
-# 除錯用座標開關
-SWAP_XY = False
-FLIP_X = False
-FLIP_Y = False
+# =============================================================
+# 固定參數
+# =============================================================
+MINRAD          = 5
+MAXRAD          = 40
+TARGET_THRESH   = 0.1
+LONGLAT_THRESH2 = 1.8
+RAD_THRESH      = 1.0
 
+TEMPLATE_THRESH_LIST = [0.35,0.45,0.5]
 
-# =========================
-# 小工具函式
-# =========================
-def load_dem_from_hdf5(h5_path, image_index, dataset_key="input_images"):
-    with h5py.File(h5_path, "r") as f:
-        img = f[dataset_key][image_index]
-
-    img = np.array(img)
-
-    if img.ndim == 3:
-        if img.shape[-1] == 1:
-            img = img[:, :, 0]
-        elif img.shape[0] == 1:
-            img = img[0]
-        else:
-            img = img[:, :, 0]
-
-    return img.astype(np.float32)
-
-
-def normalize_for_display(img):
-    mn, mx = np.min(img), np.max(img)
-    if mx - mn < 1e-8:
-        return np.zeros_like(img)
-    return (img - mn) / (mx - mn)
-
-
-def transform_coords(x, y, w, h):
-    if SWAP_XY:
-        x, y = y, x
-    if FLIP_X:
-        x = (w - 1) - x
-    if FLIP_Y:
-        y = (h - 1) - y
-    return x, y
+# =============================================================
+# 3D 工具函式
+# =============================================================
+def make_z_surface(img_norm):
+    dem_smooth = gaussian_filter(img_norm, sigma=1.5)
+    p1, p99 = np.percentile(dem_smooth, (1, 99))
+    dem_clip = np.clip(dem_smooth, p1, p99)
+    return (dem_clip - p1) / (p99 - p1 + 1e-8)
 
 
 def circle_points_3d(z_surface, xc, yc, r, n_points=200, z_offset=0.03):
     h, w = z_surface.shape
     theta = np.linspace(0, 2 * np.pi, n_points)
-
     xs = xc + r * np.cos(theta)
     ys = yc + r * np.sin(theta)
-
     valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-    xs = xs[valid]
-    ys = ys[valid]
-
+    xs, ys = xs[valid], ys[valid]
     if len(xs) == 0:
         return np.array([]), np.array([]), np.array([])
-
     xi = np.clip(np.round(xs).astype(int), 0, w - 1)
     yi = np.clip(np.round(ys).astype(int), 0, h - 1)
-
     zs = z_surface[yi, xi] + z_offset
-
     return xs, ys, zs
 
 
-def match_craters(gt_df, pred_df):
-    candidates = []
-
-    for gi, gt in gt_df.iterrows():
-        xg, yg = gt["x_plot"], gt["y_plot"]
-        rg = gt["r_pix"]
-
-        for pi, pr in pred_df.iterrows():
-            xp, yp = pr["x_plot"], pr["y_plot"]
-            rp = pr["radius"]
-
-            center_dist = np.hypot(xg - xp, yg - yp)
-            radius_diff = abs(rg - rp)
-            tol = 0.5 * max(rg, rp)
-
-            if center_dist <= tol and radius_diff <= tol:
-                score = center_dist + radius_diff
-                candidates.append((score, gi, pi))
-
-    candidates.sort(key=lambda x: x[0])
-
-    gt_used = set()
-    pred_used = set()
-    matches = []
-
-    for score, gi, pi in candidates:
-        if gi not in gt_used and pi not in pred_used:
-            gt_used.add(gi)
-            pred_used.add(pi)
-            matches.append((gi, pi, score))
-
-    return matches, gt_used, pred_used
-
-
-def make_z_surface(dem):
-    dem_smooth = gaussian_filter(dem, sigma=1.5)
-
-    p1, p99 = np.percentile(dem_smooth, (1, 99))
-    dem_clip = np.clip(dem_smooth, p1, p99)
-
-    z_surface = (dem_clip - p1) / (p99 - p1 + 1e-8)
-
-    return z_surface
-
-
-def add_plot_coords(gt_df, pred_df, w, h):
-    gt_df = gt_df.copy()
-    pred_df = pred_df.copy()
-
-    gt_df["r_pix"] = gt_df["Diameter (pix)"] / 2.0
-
-    gt_x_plot, gt_y_plot = [], []
-    for _, row in gt_df.iterrows():
-        x2, y2 = transform_coords(row["x"], row["y"], w, h)
-        gt_x_plot.append(x2)
-        gt_y_plot.append(y2)
-
-    gt_df["x_plot"] = gt_x_plot
-    gt_df["y_plot"] = gt_y_plot
-
-    pred_x_plot, pred_y_plot = [], []
-    for _, row in pred_df.iterrows():
-        x2, y2 = transform_coords(row["x_center"], row["y_center"], w, h)
-        pred_x_plot.append(x2)
-        pred_y_plot.append(y2)
-
-    pred_df["x_plot"] = pred_x_plot
-    pred_df["y_plot"] = pred_y_plot
-
-    return gt_df, pred_df
-
-
-# =========================
-# 讀 CSV
-# =========================
-gt_all = pd.read_csv(gt_csv_path)
-pred_all = pd.read_csv(pred_csv_path)
-
-
-# =========================
-# 批次畫圖
-# =========================
-for image_index_to_plot in range(NUM_IMAGES):
-    print(f"Processing image_index = {image_index_to_plot}")
-
-    # 讀 DEM
-    dem = load_dem_from_hdf5(
-        h5_path,
-        image_index_to_plot,
-        dataset_key=h5_dataset_key
-    )
-
-    h, w = dem.shape
+def draw_3d_surface(ax, z_surface, craters_gt, craters_pred, h, w):
     Y, X = np.mgrid[0:h, 0:w]
-
-    # 讀強化影像
-    enhanced_path = os.path.join(
-        enhanced_dir,
-        f"dev_image_{image_index_to_plot:05d}.png"
-    )
-
-    if os.path.exists(enhanced_path):
-        img_enhanced = np.array(Image.open(enhanced_path))
-    else:
-        print(f"Warning: 找不到強化影像，改用 DEM 顯示：{enhanced_path}")
-        img_enhanced = normalize_for_display(dem)
-
-    # 建 3D 高度
-    z_surface = make_z_surface(dem)
-
-    # 只抓同一張圖的 GT / Prediction
-    gt_df = gt_all[gt_all["image_index"] == image_index_to_plot].copy()
-    pred_df = pred_all[pred_all["image_index"] == image_index_to_plot].copy()
-
-    # 如果這張沒有資料，也可以繼續畫底圖
-    gt_df, pred_df = add_plot_coords(gt_df, pred_df, w, h)
-
-    # matching
-    matches, matched_gt_idx, matched_pred_idx = match_craters(gt_df, pred_df)
-
-    print(f"Image index = {image_index_to_plot}")
-    print(f"GT count    = {len(gt_df)}")
-    print(f"Pred count  = {len(pred_df)}")
-    print(f"Matched     = {len(matches)}")
-
-    # =========================
-    # 畫圖
-    # =========================
-    fig = plt.figure(figsize=(16, 7))
-
-    # -------- 2D --------
-    ax1 = fig.add_subplot(1, 2, 1)
-
-    if img_enhanced.ndim == 2:
-        ax1.imshow(img_enhanced, cmap="gray", origin="upper")
-    else:
-        ax1.imshow(img_enhanced, origin="upper")
-
-    ax1.set_title(f"2D Enhanced DEM Overlay (image_index={image_index_to_plot})")
-    ax1.set_xlim(0, w)
-    ax1.set_ylim(h, 0)
-
-    # GT in 2D
-    for gi, row in gt_df.iterrows():
-        edge_color = "lime" if gi in matched_gt_idx else "green"
-
-        circ = Circle(
-            (row["x_plot"], row["y_plot"]),
-            row["r_pix"],
-            fill=False,
-            edgecolor="green",
-            linewidth=2.0
-        )
-        ax1.add_patch(circ)
-
-    # Prediction in 2D
-    for pi, row in pred_df.iterrows():
-        edge_color = "lime" if pi in matched_pred_idx else "red"
-
-        circ = Circle(
-            (row["x_plot"], row["y_plot"]),
-            row["radius"],
-            fill=False,
-            edgecolor="red",
-            linewidth=1.8
-        )
-        ax1.add_patch(circ)
-
-    # -------- 3D --------
-    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-
     ls = LightSource(azdeg=315, altdeg=45)
-    rgb = ls.shade(
-        z_surface,
-        cmap=plt.cm.terrain,
-        vert_exag=1,
-        blend_mode="soft"
-    )
-
-    ax2.plot_surface(
-        X, Y, z_surface,
-        facecolors=rgb,
-        linewidth=0,
-        antialiased=True,
-        shade=False,
-        alpha=0.85
-    )
-
-    # GT in 3D
-    for _, row in gt_df.iterrows():
-        x = row["x_plot"]
-        y = row["y_plot"]
-        r = row["r_pix"]
-
-        # 跳過碰到邊界的圓，避免 3D 出現怪線
-        if (x - r < 0) or (x + r >= w) or (y - r < 0) or (y + r >= h):
+    rgb = ls.shade(z_surface, cmap=plt.cm.gray,
+                   vert_exag=1, blend_mode="soft")
+    ax.plot_surface(X, Y, z_surface, facecolors=rgb,
+                    linewidth=0, antialiased=True, shade=False, alpha=0.85)
+    # GT 綠色
+    for (gx, gy, gr) in craters_gt:
+        if (gx - gr < 0) or (gx + gr >= w) or (gy - gr < 0) or (gy + gr >= h):
             continue
-
-        xs, ys, zs = circle_points_3d(
-            z_surface,
-            x,
-            y,
-            r,
-            n_points=200,
-            z_offset=0.05
-        )
-
+        xs, ys, zs = circle_points_3d(z_surface, gx, gy, gr, z_offset=0.05)
         if len(xs) > 0:
-            ax2.plot(xs, ys, zs, color="deepskyblue", linewidth=2)
-
-    # Prediction in 3D
-    for _, row in pred_df.iterrows():
-        x = row["x_plot"]
-        y = row["y_plot"]
-        r = row["radius"]
-
-        # 跳過碰到邊界的圓，避免 3D 出現怪線
-        if (x - r < 0) or (x + r >= w) or (y - r < 0) or (y + r >= h):
+            ax.plot(xs, ys, zs, color="lime", linewidth=2)
+    # Pred 紅色
+    for (px, py, pr) in craters_pred:
+        if (px - pr < 0) or (px + pr >= w) or (py - pr < 0) or (py + pr >= h):
             continue
-
-        xs, ys, zs = circle_points_3d(
-            z_surface,
-            x,
-            y,
-            r,
-            n_points=200,
-            z_offset=0.03
-        )
-
+        xs, ys, zs = circle_points_3d(z_surface, px, py, pr, z_offset=0.03)
         if len(xs) > 0:
-            ax2.plot(xs, ys, zs, color="red", linewidth=2)
+            ax.plot(xs, ys, zs, color="red", linewidth=2)
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.set_zlim(0, np.max(z_surface) + 0.1)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Height")
+    ax.view_init(elev=35, azim=-60)
 
-    ax2.set_title(f"3D DEM Overlay (image_index={image_index_to_plot})")
 
-    ax2.set_xlim(0, w)
-    ax2.set_ylim(h, 0)
-    ax2.set_zlim(0, np.max(z_surface) + 0.1)
+# =============================================================
+# 讀取模型
+# =============================================================
+print("Loading model...")
+model = tf.keras.models.load_model(model_path, compile=False)
+print("Model loaded.\n")
 
-    ax2.set_xlabel("X")
-    ax2.set_ylabel("Y")
-    ax2.set_zlabel("Height")
+# =============================================================
+# 讀取所有圖片的預測結果（只跑一次模型）
+# =============================================================
+all_preds      = []
+all_csv_coords = []
+all_img_disp   = []
+all_img_norm   = []
 
-    ax2.view_init(elev=35, azim=-60)
+print("Running model predictions...")
+with h5py.File(dev_images_path,  "r") as f_img, \
+     h5py.File(dev_craters_path, "r") as f_crt:
 
-    plt.tight_layout()
+    total_imgs = f_img["input_images"].shape[0]
+    run_count  = min(NUM_IMAGES, total_imgs)
 
-    save_path = os.path.join(
-        output_dir,
-        f"dem_overlay_3d_{image_index_to_plot:05d}.png"
-    )
+    for idx in range(run_count):
+        img = f_img["input_images"][idx].astype("float32")
+        img_min, img_max = img.min(), img.max()
+        img_norm = (img - img_min) / (img_max - img_min + 1e-8)
 
-    plt.savefig(save_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
+        x = img_norm.reshape(1, 256, 256, 1)
+        pred_raw = model.predict(x, verbose=0)
 
-    print("Saved to:", save_path)
+        if pred_raw.ndim == 4:
+            pred = pred_raw[0, :, :, 0]
+        elif pred_raw.ndim == 3:
+            pred = pred_raw[0, :, :]
+        else:
+            raise ValueError(f"Unexpected shape: {pred_raw.shape}")
 
-print("全部完成")
+        # 讀 GT
+        id_str = f"img_{idx:05d}"
+        try:
+            block = f_crt[id_str]['block0_values'][...]
+            if block.ndim == 1:
+                block = block.reshape(1, -1)
+            if block.shape[0] == 6 and block.shape[1] != 6:
+                block = block.T
+            if block.shape[1] < 6:
+                csv_coords = np.empty((0, 3))
+            else:
+                x_pix = block[:, 3]
+                y_pix = block[:, 4]
+                r_pix = block[:, 5] / 2.0
+                csv_coords = np.column_stack([x_pix, y_pix, r_pix])
+        except KeyError:
+            csv_coords = np.empty((0, 3))
+
+        p2, p98 = np.percentile(img_norm, (2, 98))
+        img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+        all_preds.append(pred)
+        all_csv_coords.append(csv_coords)
+        all_img_disp.append(img_disp)
+        all_img_norm.append(img_norm)
+
+        if (idx + 1) % 10 == 0:
+            print(f"  Predicted {idx+1}/{run_count}...")
+
+print(f"Done. {run_count} images predicted.\n")
+
+# =============================================================
+# 對每個 threshold 跑評估 + 畫 2x3 六格圖
+# =============================================================
+sweep_results = []
+
+for thresh in TEMPLATE_THRESH_LIST:
+    print(f"{'='*55}")
+    print(f"  template_thresh = {thresh}")
+    print(f"{'='*55}")
+
+    thresh_dir = os.path.join(output_dir, f"thresh_{thresh}")
+    os.makedirs(thresh_dir, exist_ok=True)
+
+    total_TP = 0
+    total_FP = 0
+    total_FN = 0
+    err_lo_all = []
+    err_la_all = []
+    err_r_all  = []
+
+    for idx in range(run_count):
+        pred       = all_preds[idx]
+        csv_coords = all_csv_coords[idx]
+        img_disp   = all_img_disp[idx]
+        img_norm   = all_img_norm[idx]
+
+        h, w = img_disp.shape
+
+        # 評估
+        if len(csv_coords) > 0:
+            (N_match, N_csv, N_detect, maxr,
+             err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
+                pred.copy(), csv_coords.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=thresh,
+                target_thresh=TARGET_THRESH
+            )
+        else:
+            templ_coords = tmt.template_match_t(
+                pred.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=thresh,
+                target_thresh=TARGET_THRESH
+            )
+            N_match, N_csv, N_detect = 0, 0, len(templ_coords)
+            err_lo = err_la = err_r = 0.0
+
+        TP = N_match
+        FP = max(N_detect - N_match, 0)
+        FN = max(N_csv - N_match, 0)
+
+        total_TP += TP
+        total_FP += FP
+        total_FN += FN
+
+        if N_match >= 1:
+            err_lo_all.append(err_lo)
+            err_la_all.append(err_la)
+            err_r_all.append(err_r)
+
+        precision = TP / (TP + FP + 1e-8)
+        recall    = TP / (TP + FN + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
+
+        # 畫圖（前 20 張）
+        if idx < 100:
+            pred_coords = tmt.template_match_t(
+                pred.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=thresh,
+                target_thresh=TARGET_THRESH
+            )
+
+            z_surface = make_z_surface(img_norm)
+
+            # 2x3 六格圖
+            fig = plt.figure(figsize=(18, 10))
+
+            # 上排
+            # [0,0] 原圖
+            ax00 = fig.add_subplot(2, 3, 1)
+            ax00.imshow(img_disp, cmap="gray")
+            ax00.set_title("Original Image")
+            ax00.axis("off")
+
+            # [0,1] 模型熱圖
+            ax01 = fig.add_subplot(2, 3, 2)
+            ax01.imshow(pred, cmap="hot", vmin=0, vmax=1)
+            ax01.set_title("Model Heatmap")
+            ax01.axis("off")
+
+            # [0,2] Ground Truth（綠）
+            ax02 = fig.add_subplot(2, 3, 3)
+            ax02.imshow(img_disp, cmap="gray")
+            for (gx, gy, gr) in csv_coords:
+                ax02.add_patch(Circle((gx, gy), gr,
+                    fill=False, edgecolor="lime", linewidth=1.5))
+            ax02.set_title(f"Ground Truth ({len(csv_coords)} craters)")
+            ax02.axis("off")
+
+            # 下排
+            # [1,0] 預測（紅）
+            ax10 = fig.add_subplot(2, 3, 4)
+            ax10.imshow(img_disp, cmap="gray")
+            for (px, py, pr) in pred_coords:
+                ax10.add_patch(Circle((px, py), pr,
+                    fill=False, edgecolor="red", linewidth=1.5))
+            ax10.set_title(f"Prediction ({len(pred_coords)} craters)")
+            ax10.axis("off")
+
+            # [1,1] GT + 預測疊加
+            ax11 = fig.add_subplot(2, 3, 5)
+            ax11.imshow(img_disp, cmap="gray")
+            for (gx, gy, gr) in csv_coords:
+                ax11.add_patch(Circle((gx, gy), gr,
+                    fill=False, edgecolor="lime", linewidth=1.5))
+            for (px, py, pr) in pred_coords:
+                ax11.add_patch(Circle((px, py), pr,
+                    fill=False, edgecolor="red", linewidth=1.5))
+            ax11.set_title(
+                f"GT(green) + Pred(red)\n"
+                f"P={precision:.2f}  R={recall:.2f}  F1={f1:.2f}"
+            )
+            ax11.axis("off")
+
+            # [1,2] 3D 疊加
+            ax12 = fig.add_subplot(2, 3, 6, projection="3d")
+            draw_3d_surface(ax12, z_surface, csv_coords, pred_coords, h, w)
+            ax12.set_title("3D DEM\nGT(green) + Pred(red)")
+
+            plt.suptitle(
+                f"[Moon] Image {idx:05d} | thresh={thresh} | "
+                f"TP={TP} FP={FP} FN={FN}",
+                fontsize=13
+            )
+            plt.tight_layout()
+            fig.savefig(os.path.join(thresh_dir, f"result_{idx:05d}.png"),
+                        dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            gc.collect()
+
+    # 總結
+    total_precision = total_TP / (total_TP + total_FP + 1e-8)
+    total_recall    = total_TP / (total_TP + total_FN + 1e-8)
+    total_f1        = (2 * total_precision * total_recall
+                       / (total_precision + total_recall + 1e-8))
+    mean_err_lo = np.mean(err_lo_all) if err_lo_all else 0.0
+    mean_err_la = np.mean(err_la_all) if err_la_all else 0.0
+    mean_err_r  = np.mean(err_r_all)  if err_r_all  else 0.0
+
+    print(f"  TP={total_TP}, FP={total_FP}, FN={total_FN}")
+    print(f"  Precision : {total_precision:.4f}")
+    print(f"  Recall    : {total_recall:.4f}")
+    print(f"  F1-score  : {total_f1:.4f}")
+    print(f"  Long err  : {mean_err_lo*100:.1f}%")
+    print(f"  Lat err   : {mean_err_la*100:.1f}%")
+    print(f"  Rad err   : {mean_err_r*100:.1f}%\n")
+
+    sweep_results.append({
+        "template_thresh": thresh,
+        "Precision": total_precision,
+        "Recall":    total_recall,
+        "F1":        total_f1,
+        "Long_err":  mean_err_lo * 100,
+        "Lat_err":   mean_err_la * 100,
+        "Rad_err":   mean_err_r  * 100,
+    })
+
+# =============================================================
+# 最終比較表
+# =============================================================
+print("\n" + "="*65)
+print("  Threshold Sweep 結果比較")
+print("="*65)
+print(f"  {'Thresh':>8} | {'Precision':>10} | {'Recall':>8} | {'F1':>8}")
+print("-"*65)
+best = max(sweep_results, key=lambda x: x["F1"])
+for r in sweep_results:
+    marker = " <- best F1" if r["template_thresh"] == best["template_thresh"] else ""
+    print(f"  {r['template_thresh']:>8} | "
+          f"{r['Precision']:>10.4f} | "
+          f"{r['Recall']:>8.4f} | "
+          f"{r['F1']:>8.4f}{marker}")
+print("="*65)
+print(f"\n  最佳 threshold = {best['template_thresh']}")
+print(f"  Best F1        = {best['F1']:.4f}")
+print(f"  Precision      = {best['Precision']:.4f}")
+print(f"  Recall         = {best['Recall']:.4f}")
+
+print("\n  [論文 Post-Processed Test 參考]")
+print("  Recall=92%, Precision=56%")
+print(f"\n  圖片輸出：{output_dir}")
