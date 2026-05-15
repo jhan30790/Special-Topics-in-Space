@@ -73,7 +73,7 @@ def generate_image(n_craters, radius, depth, size=256, seed=0):
     """
     rng = np.random.default_rng(seed)
     img = make_background(size=size, seed=seed)
-    
+
     coords = []  # (cx, cy, radius)
     margin = radius + 5
     attempts = 0
@@ -81,8 +81,7 @@ def generate_image(n_craters, radius, depth, size=256, seed=0):
     while len(coords) < n_craters and attempts < 1000:
         cx = int(rng.integers(margin, size - margin))
         cy = int(rng.integers(margin, size - margin))
-        
-        # 密度控制：不同密度允許不同重疊程度
+
         # 直接放置，不做排斥（讓重疊自然發生）
         img = add_crater(img, cx, cy, radius, depth)
         coords.append((cx, cy, radius))
@@ -92,7 +91,7 @@ def generate_image(n_craters, radius, depth, size=256, seed=0):
     return img, coords
 
 # =============================================================
-# 實驗網格
+# 實驗網格（坑洞數量維持原始設定）
 # =============================================================
 radius_cases = [
     ("small",  7),
@@ -111,10 +110,9 @@ density_cases = [
 ]
 
 # =============================================================
-# 跑實驗
+# 主實驗迴圈
 # =============================================================
 results = []
-
 total = len(radius_cases) * len(depth_cases) * len(density_cases)
 count = 0
 
@@ -125,47 +123,52 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
     label = f"{r_name}_depth{d_name}_den{den_name}"
     print(f"[{count}/{total}] {label}")
 
-    # 產生圖
-    img, gt_coords = generate_image(n_craters, radius, depth, seed=count)
-    gt_coords = np.array(gt_coords, dtype=np.float32)  # shape (N, 3)
+    # ── 產生圖 ──────────────────────────────────────────────
+    img, gt_list = generate_image(n_craters, radius, depth, seed=count)
+    gt_coords = np.array(gt_list, dtype=np.float32)   # shape (N, 3)
 
-    # 前處理（跟你原本一樣）
+    # ── 前處理 ──────────────────────────────────────────────
     img_min, img_max = img.min(), img.max()
     img_norm = (img - img_min) / (img_max - img_min + 1e-8)
     x = img_norm.reshape(1, 256, 256, 1)
 
-    # 模型推論
+    # ── 模型推論 ─────────────────────────────────────────────
     pred_raw = model.predict(x, verbose=0)
     if pred_raw.ndim == 4:
         pred = pred_raw[0, :, :, 0]
     elif pred_raw.ndim == 3:
         pred = pred_raw[0, :, :]
+    else:
+        raise ValueError(f"Unexpected pred shape: {pred_raw.shape}")
 
-    # 後處理
-    pred_coords = tmt.template_match_t(
-        pred.copy(),
-        minrad=MINRAD, maxrad=MAXRAD,
-        longlat_thresh2=LONGLAT_THRESH2,
-        rad_thresh=RAD_THRESH,
-        template_thresh=TEMPLATE_THRESH,
-        target_thresh=TARGET_THRESH
-    )
+    # ── 評估（使用 template_match_t2c，與火星版一致）─────────
+    if len(gt_coords) > 0:
+        (N_match, N_csv, N_detect, maxr,
+         err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
+            pred.copy(),
+            gt_coords.copy(),
+            minrad=MINRAD, maxrad=MAXRAD,
+            longlat_thresh2=LONGLAT_THRESH2,
+            rad_thresh=RAD_THRESH,
+            template_thresh=TEMPLATE_THRESH,
+            target_thresh=TARGET_THRESH
+        )
+    else:
+        # 無 GT 時只做純偵測，不計算誤差
+        templ_coords = tmt.template_match_t(
+            pred.copy(),
+            minrad=MINRAD, maxrad=MAXRAD,
+            longlat_thresh2=LONGLAT_THRESH2,
+            rad_thresh=RAD_THRESH,
+            template_thresh=TEMPLATE_THRESH,
+            target_thresh=TARGET_THRESH
+        )
+        N_match, N_csv, N_detect = 0, 0, len(templ_coords)
+        err_lo = err_la = err_r = 0.0
 
-    # 評估：簡單 IoU-based matching
-    # 用坑中心距離 < (r_pred + r_gt)*0.5 且半徑差 < r_gt 來算 TP
-    matched_gt = set()
-    matched_pred = set()
-    for pi, (px, py, pr) in enumerate(pred_coords):
-        for gi, (gx, gy, gr) in enumerate(gt_coords):
-            dist = np.sqrt((px - gx)**2 + (py - gy)**2)
-            if dist < (pr + gr) * 0.5 and abs(pr - gr) < gr:
-                if gi not in matched_gt and pi not in matched_pred:
-                    matched_gt.add(gi)
-                    matched_pred.add(pi)
-
-    TP = len(matched_gt)
-    FP = len(pred_coords) - TP
-    FN = len(gt_coords) - TP
+    TP = N_match
+    FP = max(N_detect - N_match, 0)
+    FN = max(N_csv   - N_match, 0)
     precision = TP / (TP + FP + 1e-8)
     recall    = TP / (TP + FN + 1e-8)
     f1        = 2 * precision * recall / (precision + recall + 1e-8)
@@ -175,17 +178,30 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
         "radius":    r_name,
         "depth":     d_name,
         "density":   den_name,
-        "n_gt":      len(gt_coords),
-        "n_pred":    len(pred_coords),
+        "n_gt":      N_csv,
+        "n_pred":    N_detect,
         "TP": TP, "FP": FP, "FN": FN,
         "Precision": precision,
         "Recall":    recall,
         "F1":        f1,
+        "err_lo":    err_lo,
+        "err_la":    err_la,
+        "err_r":     err_r,
     })
 
-    # 存圖
+    # ── 畫圖 ────────────────────────────────────────────────
     p2, p98 = np.percentile(img_norm, (2, 98))
     img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+    # 用 template_match_t 取出圓圈座標（t2c 不回傳圓圈列表）
+    pred_coords = tmt.template_match_t(
+        pred.copy(),
+        minrad=MINRAD, maxrad=MAXRAD,
+        longlat_thresh2=LONGLAT_THRESH2,
+        rad_thresh=RAD_THRESH,
+        template_thresh=TEMPLATE_THRESH,
+        target_thresh=TARGET_THRESH
+    )
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
@@ -205,11 +221,15 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
         axes[2].add_patch(Circle((px, py), pr,
             fill=False, edgecolor="red", linewidth=1.5))
     axes[2].set_title(
-        f"GT(green) Pred(red)\nP={precision:.2f} R={recall:.2f} F1={f1:.2f}"
+        f"GT(green) Pred(red)\n"
+        f"P={precision:.2f}  R={recall:.2f}  F1={f1:.2f}\n"
+        f"Err lo={err_lo*100:.1f}%  la={err_la*100:.1f}%  r={err_r*100:.1f}%"
     )
     axes[2].axis("off")
 
-    plt.suptitle(f"{label} | r={radius}px depth={depth} n={n_craters}", fontsize=11)
+    plt.suptitle(
+        f"{label} | r={radius}px  depth={depth}  n_gt={N_csv}", fontsize=11
+    )
     plt.tight_layout()
     fig.savefig(os.path.join(output_dir, f"{label}.png"), dpi=100, bbox_inches="tight")
     plt.close(fig)
@@ -218,15 +238,16 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
 # =============================================================
 # 印出結果總表
 # =============================================================
-print("\n" + "="*80)
+print("\n" + "="*100)
 print("  壓力測試結果總表")
-print("="*80)
-print(f"  {'條件':<40} | {'GT':>4} | {'Pred':>4} | {'P':>6} | {'R':>6} | {'F1':>6}")
-print("-"*80)
+print("="*100)
+print(f"  {'條件':<40} | {'GT':>4} | {'Pred':>4} | {'P':>6} | {'R':>6} | {'F1':>6} | {'lo%':>6} | {'la%':>6} | {'r%':>6}")
+print("-"*100)
 for r in results:
     print(f"  {r['label']:<40} | {r['n_gt']:>4} | {r['n_pred']:>4} | "
-          f"{r['Precision']:>6.3f} | {r['Recall']:>6.3f} | {r['F1']:>6.3f}")
-print("="*80)
+          f"{r['Precision']:>6.3f} | {r['Recall']:>6.3f} | {r['F1']:>6.3f} | "
+          f"{r['err_lo']*100:>6.1f} | {r['err_la']*100:>6.1f} | {r['err_r']*100:>6.1f}")
+print("="*100)
 print(f"\n圖片輸出：{output_dir}")
 
 # =============================================================
@@ -252,18 +273,16 @@ density_sweep = [
 shallow_dir = os.path.join(output_dir, "shallow_sweep")
 os.makedirs(shallow_dir, exist_ok=True)
 
-# 先把所有 shallow 條件的圖和 GT 準備好（固定 seed 跟主實驗一致）
-shallow_images = {}
-for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sweep):
-    # seed 要跟主實驗一致：用 count 的順序
-    # 主實驗的順序是 radius × depth × density
-    # shallow 是 depth index=0，所以 seed = r_idx*9 + 0*3 + den_idx + 1
-    r_idx  = ["small","medium","large"].index(r_name)
-    den_idx = ["sparse","moderate","dense"].index(den_name)
-    seed = r_idx * 9 + 0 * 3 + den_idx + 1
+# ── 先跑推論，把 pred / gt / img_disp 存好（避免重複跑模型）──
+shallow_cache = {}
 
-    img, gt_coords = generate_image(n_craters, radius, depth=0.1, seed=seed)
-    gt_coords = np.array(gt_coords, dtype=np.float32)
+for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sweep):
+    r_idx   = ["small", "medium", "large"].index(r_name)
+    den_idx = ["sparse", "moderate", "dense"].index(den_name)
+    seed    = r_idx * 9 + 0 * 3 + den_idx + 1   # 與主實驗 seed 對齊
+
+    img, gt_list = generate_image(n_craters, radius, depth=0.1, seed=seed)
+    gt_coords = np.array(gt_list, dtype=np.float32)
 
     img_min, img_max = img.min(), img.max()
     img_norm = (img - img_min) / (img_max - img_min + 1e-8)
@@ -278,57 +297,61 @@ for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sw
     p2, p98 = np.percentile(img_norm, (2, 98))
     img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
 
-    shallow_images[(r_name, den_name)] = {
-        "pred": pred,
-        "gt": gt_coords,
-        "img_disp": img_disp,
-        "radius": radius,
+    shallow_cache[(r_name, den_name)] = {
+        "pred":      pred,
+        "gt":        gt_coords,
+        "img_disp":  img_disp,
+        "radius":    radius,
         "n_craters": n_craters,
     }
 
-# sweep
-sweep_summary = []  # (r_name, den_name, thresh, P, R, F1)
+# ── Threshold sweep ──────────────────────────────────────────
+sweep_summary = []  # (r_name, den_name, thresh, P, R, F1, n_pred)
 
 for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sweep):
-    data = shallow_images[(r_name, den_name)]
+    data      = shallow_cache[(r_name, den_name)]
     pred      = data["pred"]
     gt_coords = data["gt"]
-    img_disp  = data["img_disp"]
-
-    best_thresh_result = None
 
     for thresh in THRESH_LIST:
-        pred_coords = tmt.template_match_t(
-            pred.copy(),
-            minrad=MINRAD, maxrad=MAXRAD,
-            longlat_thresh2=LONGLAT_THRESH2,
-            rad_thresh=RAD_THRESH,
-            template_thresh=thresh,
-            target_thresh=TARGET_THRESH
-        )
 
-        matched_gt   = set()
-        matched_pred = set()
-        for pi, (px, py, pr) in enumerate(pred_coords):
-            for gi, (gx, gy, gr) in enumerate(gt_coords):
-                dist = np.sqrt((px - gx)**2 + (py - gy)**2)
-                if dist < (pr + gr) * 0.5 and abs(pr - gr) < gr:
-                    if gi not in matched_gt and pi not in matched_pred:
-                        matched_gt.add(gi)
-                        matched_pred.add(pi)
+        # ── 評估（template_match_t2c）────────────────────────
+        if len(gt_coords) > 0:
+            (N_match, N_csv, N_detect, maxr,
+             err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
+                pred.copy(),
+                gt_coords.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=thresh,
+                target_thresh=TARGET_THRESH
+            )
+        else:
+            templ_coords = tmt.template_match_t(
+                pred.copy(),
+                minrad=MINRAD, maxrad=MAXRAD,
+                longlat_thresh2=LONGLAT_THRESH2,
+                rad_thresh=RAD_THRESH,
+                template_thresh=thresh,
+                target_thresh=TARGET_THRESH
+            )
+            N_match, N_csv, N_detect = 0, 0, len(templ_coords)
 
-        TP = len(matched_gt)
-        FP = len(pred_coords) - TP
-        FN = len(gt_coords) - TP
+        TP = N_match
+        FP = max(N_detect - N_match, 0)
+        FN = max(N_csv   - N_match, 0)
         precision = TP / (TP + FP + 1e-8)
         recall    = TP / (TP + FN + 1e-8)
         f1        = 2 * precision * recall / (precision + recall + 1e-8)
 
-        sweep_summary.append((r_name, den_name, thresh, precision, recall, f1, len(pred_coords)))
+        sweep_summary.append((r_name, den_name, thresh, precision, recall, f1, N_detect))
 
-    # 畫這個條件的 threshold vs F1 折線圖
-    row = [(t, f1) for (rn, dn, t, p, r, f1, _) in sweep_summary
-           if rn == r_name and dn == den_name]
+    # ── 畫 threshold vs F1 折線圖 ────────────────────────────
+    row = [
+        (t, f1) for (rn, dn, t, p, r, f1, _) in sweep_summary
+        if rn == r_name and dn == den_name
+    ]
     thresholds = [t for t, _ in row]
     f1s        = [f for _, f in row]
 
@@ -336,7 +359,9 @@ for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sw
     ax.plot(thresholds, f1s, marker="o", color="steelblue")
     ax.set_xlabel("Template Threshold")
     ax.set_ylabel("F1 Score")
-    ax.set_title(f"Shallow | {r_name} r={radius}px | density={den_name} n={n_craters}")
+    ax.set_title(
+        f"Shallow | {r_name} r={radius}px | density={den_name} n={n_craters}"
+    )
     ax.set_ylim(-0.05, 1.05)
     ax.grid(True)
     plt.tight_layout()
@@ -347,12 +372,12 @@ for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sw
     plt.close(fig)
     gc.collect()
 
-# 印出結果
+# ── 印出 sweep 結果 ───────────────────────────────────────────
 print(f"\n  {'Size':<8} {'Density':<10} {'Thresh':>7} | {'Pred':>5} | {'P':>6} | {'R':>6} | {'F1':>6}")
 print("-"*70)
 for (r_name, den_name, thresh, p, r, f1, n_pred) in sweep_summary:
     marker = " <--" if thresh == 0.35 else ""
     print(f"  {r_name:<8} {den_name:<10} {thresh:>7.2f} | {n_pred:>5} | "
           f"{p:>6.3f} | {r:>6.3f} | {f1:>6.3f}{marker}")
-    
+
 print(f"\n圖片輸出：{shallow_dir}")
