@@ -27,7 +27,7 @@ MAXRAD          = 40
 TARGET_THRESH   = 0.1
 LONGLAT_THRESH2 = 1.8
 RAD_THRESH      = 1.0
-TEMPLATE_THRESH = 0.35   # 主實驗使用的 threshold
+TEMPLATE_THRESH = 0.35
 
 # =============================================================
 # 載入模型
@@ -39,57 +39,75 @@ print("Model loaded.\n")
 # =============================================================
 # 產生底圖函數
 # =============================================================
-def make_background(size=256, base=0.5, noise_std=0.02, seed=42):
-    """均勻灰階底圖 + 輕微噪聲"""
+def make_background(size=256, base=0.45, noise_std=0.05, seed=42):
+    """
+    底圖：中灰 + 較多噪聲，模擬 DEM 地形紋理。
+    base 稍低(0.45)讓坑洞凹陷更明顯。
+    noise_std=0.05 提供足夠背景紋理。
+    """
     rng = np.random.default_rng(seed)
     bg = np.full((size, size), base, dtype=np.float32)
     bg += rng.normal(0, noise_std, (size, size)).astype(np.float32)
     return np.clip(bg, 0, 1)
 
 # =============================================================
-# 產生單一坑洞函數
+# 產生單一坑洞函數（重新設計）
 # =============================================================
 def add_crater(img, cx, cy, radius, depth):
     """
-    在 img 上疊加一個碗狀隕石坑：
-    - 坑底：往下凹（高斯碗）
-    - 坑緣：輕微隆起（環形高斯）
+    重新設計的坑洞合成，模擬 DEM 高程圖的真實外觀：
+
+    DeepMoon 訓練資料特性：
+      - 坑洞是高程凹陷，normalize 後呈現暗色
+      - 坑緣是高程隆起，略亮於周圍地形
+      - 沒有人工白環；明暗過渡自然平滑
+      - 坑內部有輕微高程起伏（不是純黑）
+
+    設計：
+      1. 坑底：線性碗（非高斯），從中心到坑緣線性爬升，
+               模擬真實坑洞的碗狀剖面
+      2. 坑緣：窄高斯隆起，強度適中（depth*0.25）
+      3. 坑外：指數衰減回到背景，避免影響範圍太大
+      4. 不加人工白環（舊版 rim depth*0.8 太誇張）
     """
     size = img.shape[0]
     yy, xx = np.ogrid[:size, :size]
     dist = np.sqrt((xx - cx)**2 + (yy - cy)**2).astype(np.float32)
 
-    sigma_bowl = radius * 0.6
-    bowl = -depth * np.exp(-dist**2 / (2 * sigma_bowl**2))
+    # --- 坑內（dist <= radius）：線性碗，中心最深，邊緣回0 ---
+    inner_mask = (dist <= radius).astype(np.float32)
+    # 線性：中心 = -depth，坑緣 = 0
+    bowl_linear = -depth * (1.0 - dist / (radius + 1e-8)) * inner_mask
 
-    sigma_rim = radius * 0.3
-    rim = depth * 0.3 * np.exp(-(dist - radius)**2 / (2 * sigma_rim**2))
+    # --- 坑緣隆起（dist 在 radius 附近）：小幅高斯環 ---
+    sigma_rim = radius * 0.25
+    rim = depth * 0.25 * np.exp(-(dist - radius)**2 / (2 * sigma_rim**2))
 
-    img += bowl + rim
+    # --- 坑外過渡（dist > radius）：指數衰減，避免影響太遠 ---
+    outer_mask = (dist > radius).astype(np.float32)
+    decay = -depth * 0.05 * np.exp(-(dist - radius) / (radius * 0.3)) * outer_mask
+
+    img += bowl_linear + rim + decay
     return img
 
 # =============================================================
 # 產生圖像函數（最多 5 個坑，坑間強制最小間距）
 # =============================================================
-def generate_image(n_craters, radius, depth, size=256, seed=0, min_sep_factor=2.5):
+def generate_image(n_craters, radius, depth, size=256, seed=0, min_sep_factor=2.8):
     """
     產生一張含最多 n_craters 個假坑的圖（硬上限 5 個）。
-    坑洞中心距離至少 radius * min_sep_factor，確保不黏在一起。
-
-    回傳：
-        img    : float32 numpy array, shape (size, size)
-        coords : list of (cx, cy, radius)
+    min_sep_factor 提高到 2.8，確保坑緣不互相干擾。
     """
     n_craters = min(n_craters, 5)
 
     rng = np.random.default_rng(seed)
     img = make_background(size=size, seed=seed)
 
-    coords      = []
-    margin      = radius + 5
-    min_dist    = radius * min_sep_factor
+    coords       = []
+    margin       = radius + 10   # 增加邊距，避免坑緣超出圖像
+    min_dist     = radius * min_sep_factor
     max_attempts = 2000
-    attempts    = 0
+    attempts     = 0
 
     while len(coords) < n_craters and attempts < max_attempts:
         cx = int(rng.integers(margin, size - margin))
@@ -110,7 +128,7 @@ def generate_image(n_craters, radius, depth, size=256, seed=0, min_sep_factor=2.
     return img, coords
 
 # =============================================================
-# 實驗網格（density 上限 5）
+# 實驗網格
 # =============================================================
 radius_cases = [
     ("small",  7),
@@ -118,9 +136,9 @@ radius_cases = [
     ("large",  32),
 ]
 depth_cases = [
-    ("shallow", 0.1),
-    ("medium",  0.3),
-    ("deep",    0.5),
+    ("shallow", 0.2),   # 用 0.2 作為淺坑基準（線性碗，實際視覺比高斯版淺）
+    ("medium",  0.4),
+    ("deep",    0.6),
 ]
 density_cases = [
     ("sparse",   2),
@@ -144,9 +162,9 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
 
     # ── 產生圖 ──────────────────────────────────────────────
     img, gt_list = generate_image(
-        n_craters, radius, depth, seed=count, min_sep_factor=2.5
+        n_craters, radius, depth, seed=count, min_sep_factor=2.8
     )
-    gt_coords = np.array(gt_list, dtype=np.float32)   # shape (N, 3)
+    gt_coords = np.array(gt_list, dtype=np.float32)
 
     # ── 前處理 ──────────────────────────────────────────────
     img_min, img_max = img.min(), img.max()
@@ -162,7 +180,7 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
     else:
         raise ValueError(f"Unexpected pred shape: {pred_raw.shape}")
 
-    # ── 評估（使用 template_match_t2c，與火星版一致）─────────
+    # ── 評估（template_match_t2c）────────────────────────────
     if len(gt_coords) > 0:
         (N_match, N_csv, N_detect, maxr,
          err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
@@ -175,7 +193,6 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
             target_thresh=TARGET_THRESH
         )
     else:
-        # 無 GT 時只做純偵測，不計算誤差
         templ_coords = tmt.template_match_t(
             pred.copy(),
             minrad=MINRAD, maxrad=MAXRAD,
@@ -214,7 +231,6 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
     p2, p98 = np.percentile(img_norm, (2, 98))
     img_disp = np.clip((img_norm - p2) / (p98 - p2 + 1e-8), 0, 1)
 
-    # 用 template_match_t 再取一次預測圈（純為畫圖用）
     pred_coords = tmt.template_match_t(
         pred.copy(),
         minrad=MINRAD, maxrad=MAXRAD,
@@ -296,16 +312,16 @@ density_sweep = [
 shallow_dir = os.path.join(output_dir, "shallow_sweep")
 os.makedirs(shallow_dir, exist_ok=True)
 
-# ── 先跑推論，把 pred / gt / img_disp 存好（避免重複跑模型）──
+# ── 先跑推論，存 pred / gt / img_disp ───────────────────────
 shallow_cache = {}
 
 for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sweep):
     r_idx   = ["small", "medium", "large"].index(r_name)
     den_idx = ["sparse", "moderate", "dense"].index(den_name)
-    seed    = r_idx * 9 + 0 * 3 + den_idx + 1   # 與主實驗 seed 對齊
+    seed    = r_idx * 9 + 0 * 3 + den_idx + 1
 
     img, gt_list = generate_image(
-        n_craters, radius, depth=0.1, seed=seed, min_sep_factor=2.5
+        n_craters, radius, depth=0.2, seed=seed, min_sep_factor=2.8
     )
     gt_coords = np.array(gt_list, dtype=np.float32)
 
@@ -331,7 +347,7 @@ for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sw
     }
 
 # ── Threshold sweep ──────────────────────────────────────────
-sweep_summary = []  # (r_name, den_name, thresh, P, R, F1, n_pred)
+sweep_summary = []
 
 for (r_name, radius), (den_name, n_craters) in product(shallow_cases, density_sweep):
     data      = shallow_cache[(r_name, den_name)]
