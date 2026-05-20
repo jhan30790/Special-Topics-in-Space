@@ -47,7 +47,7 @@ def make_background(size=256, base=0.5, noise_std=0.02, seed=42):
     return np.clip(bg, 0, 1)
 
 # =============================================================
-# 產生單一坑洞函數（方案 A：強化坑緣）
+# 產生單一坑洞函數（方案 A：強化坑緣，移除 wall）
 # =============================================================
 def add_crater(img, cx, cy, radius, depth):
     """
@@ -57,7 +57,7 @@ def add_crater(img, cx, cy, radius, depth):
       1. sigma_bowl: 0.6 → 0.5，讓坑底凹陷更集中、邊緣更陡
       2. rim 強度:   depth*0.3 → depth*0.8，坑緣明顯亮環
       3. sigma_rim:  radius*0.3 → radius*0.2，亮環更窄更銳利
-      4. 新增 wall:  坑內壁線性漸層，模擬坑壁由亮到暗的陰影過渡
+      4. 移除 wall 項：避免坑內產生紋理被模型誤判為小坑
     """
     size = img.shape[0]
     yy, xx = np.ogrid[:size, :size]
@@ -71,12 +71,7 @@ def add_crater(img, cx, cy, radius, depth):
     sigma_rim = radius * 0.2
     rim = depth * 0.8 * np.exp(-(dist - radius)**2 / (2 * sigma_rim**2))
 
-    # 3. 坑壁陰影：坑內側（dist < radius）從中心往外線性變亮，
-    #    模擬真實坑洞坑壁的明暗漸層
-    wall_mask = (dist < radius).astype(np.float32)
-    wall = depth * 0.3 * (dist / (radius + 1e-8)) * wall_mask
-
-    img += bowl + rim + wall
+    img += bowl + rim
     return img
 
 # =============================================================
@@ -86,21 +81,17 @@ def generate_image(n_craters, radius, depth, size=256, seed=0, min_sep_factor=2.
     """
     產生一張含最多 n_craters 個假坑的圖（硬上限 5 個）。
     坑洞中心距離至少 radius * min_sep_factor，確保不黏在一起。
-
-    回傳：
-        img    : float32 numpy array, shape (size, size)
-        coords : list of (cx, cy, radius)
     """
     n_craters = min(n_craters, 5)
 
     rng = np.random.default_rng(seed)
     img = make_background(size=size, seed=seed)
 
-    coords      = []
-    margin      = radius + 5
-    min_dist    = radius * min_sep_factor
+    coords       = []
+    margin       = radius + 5
+    min_dist     = radius * min_sep_factor
     max_attempts = 2000
-    attempts    = 0
+    attempts     = 0
 
     while len(coords) < n_craters and attempts < max_attempts:
         cx = int(rng.integers(margin, size - margin))
@@ -157,7 +148,7 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
     img, gt_list = generate_image(
         n_craters, radius, depth, seed=count, min_sep_factor=2.5
     )
-    gt_coords = np.array(gt_list, dtype=np.float32)   # shape (N, 3)
+    gt_coords = np.array(gt_list, dtype=np.float32)
 
     # ── 前處理 ──────────────────────────────────────────────
     img_min, img_max = img.min(), img.max()
@@ -173,7 +164,7 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
     else:
         raise ValueError(f"Unexpected pred shape: {pred_raw.shape}")
 
-    # ── 評估（使用 template_match_t2c，與火星版一致）─────────
+    # ── 評估（template_match_t2c）────────────────────────────
     if len(gt_coords) > 0:
         (N_match, N_csv, N_detect, maxr,
          err_lo, err_la, err_r, frac_dupes) = tmt.template_match_t2c(
@@ -268,7 +259,7 @@ for (r_name, radius), (d_name, depth), (den_name, n_craters) in product(
     gc.collect()
 
 # =============================================================
-# 印出結果總表
+# 印出結果總表（逐條）
 # =============================================================
 print("\n" + "="*100)
 print("  壓力測試結果總表")
@@ -280,6 +271,54 @@ for r in results:
           f"{r['Precision']:>6.3f} | {r['Recall']:>6.3f} | {r['F1']:>6.3f} | "
           f"{r['err_lo']*100:>6.1f} | {r['err_la']*100:>6.1f} | {r['err_r']*100:>6.1f}")
 print("="*100)
+
+# =============================================================
+# 依坑洞大小分組統計（小坑 / 中坑 / 大坑 / 全體）
+# 每張圖的坑半徑固定，直接按 radius 欄位分組累計
+# =============================================================
+group_accum = {
+    "small":  {"TP": 0, "FP": 0, "FN": 0},
+    "medium": {"TP": 0, "FP": 0, "FN": 0},
+    "large":  {"TP": 0, "FP": 0, "FN": 0},
+}
+
+for r in results:
+    g = r["radius"]   # "small" / "medium" / "large"
+    group_accum[g]["TP"] += r["TP"]
+    group_accum[g]["FP"] += r["FP"]
+    group_accum[g]["FN"] += r["FN"]
+
+print("\n" + "="*65)
+print("  依坑洞大小分組統計（累計所有 depth × density 條件）")
+print("="*65)
+print(f"  {'組別':<8} | {'TP':>5} | {'FP':>5} | {'FN':>5} | {'Precision':>10} | {'Recall':>8} | {'F1':>8}")
+print(f"  {'-'*63}")
+
+total_TP = total_FP = total_FN = 0
+group_labels = [("small", "小坑 (r= 7px)"),
+                ("medium", "中坑 (r=17px)"),
+                ("large", "大坑 (r=32px)")]
+
+for key, display in group_labels:
+    tp = group_accum[key]["TP"]
+    fp = group_accum[key]["FP"]
+    fn = group_accum[key]["FN"]
+    total_TP += tp
+    total_FP += fp
+    total_FN += fn
+    p  = tp / (tp + fp + 1e-8)
+    r  = tp / (tp + fn + 1e-8)
+    f1 = 2 * p * r / (p + r + 1e-8)
+    print(f"  {display:<14} | {tp:>5} | {fp:>5} | {fn:>5} | {p:>10.4f} | {r:>8.4f} | {f1:>8.4f}")
+
+# 全體
+p_all  = total_TP / (total_TP + total_FP + 1e-8)
+r_all  = total_TP / (total_TP + total_FN + 1e-8)
+f1_all = 2 * p_all * r_all / (p_all + r_all + 1e-8)
+print(f"  {'-'*63}")
+print(f"  {'全體':<14} | {total_TP:>5} | {total_FP:>5} | {total_FN:>5} | "
+      f"{p_all:>10.4f} | {r_all:>8.4f} | {f1_all:>8.4f}")
+print("="*65)
 print(f"\n圖片輸出：{output_dir}")
 
 # =============================================================
