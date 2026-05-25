@@ -20,8 +20,8 @@ import utils.template_match_target as tmt
 # 路徑設定
 # =============================================================
 model_path        = r"C:\Users\jhan3\OneDrive\桌面\大二專題\DeepMoon-master\model_keras2.h5"
-mars_images_path  = r"C:\Users\jhan3\OneDrive\桌面\大二專題\deepmars-master\data\processed\mars_test_images_00000.hdf5"
-mars_craters_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\deepmars-master\data\processed\mars_test_craters_00000.hdf5"
+mars_images_path  = r"C:\Users\jhan3\OneDrive\桌面\大二專題\deepmars-master\data\processed\mars_1000_images_00000.hdf5"
+mars_craters_path = r"C:\Users\jhan3\OneDrive\桌面\大二專題\deepmars-master\data\processed\mars_1000_craters_00000.hdf5"
 
 output_dir = r"C:\Users\jhan3\OneDrive\桌面\大二專題\result_mars_zeroshot"
 os.makedirs(output_dir, exist_ok=True)
